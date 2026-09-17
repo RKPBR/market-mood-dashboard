@@ -1,6 +1,6 @@
-Symbol
-RELIANCE.NS
-TCS.NS
-HDFCBANK.NS
-INFY.NS
-ICICIBANK.NS
+yfinance_symbol,industry
+RELIANCE.NS,Energy
+TCS.NS,IT
+HDFCBANK.NS,Financial Services
+INFY.NS,IT
+ICICIBANK.NS,Financial Services
