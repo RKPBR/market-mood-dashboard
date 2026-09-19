@@ -3,9 +3,18 @@ Market Mood Dashboard — single-page Streamlit app
 ====================================================
 Consolidates everything into ONE page, like the RSI2 dashboard:
   - Layer 1: Nifty50 market filter
-  - Layer 2: Top-3 sector ranking (relative strength)
-  - Layer 3: Regime per top sector (ADX14 + 200EMA slope)
-  - Layer 4: Entry scan (1990 for Uptrend sectors, Bollinger for Sideways sectors)
+  - Layer 2: Sector ranking (relative strength) — Top-3 used to gate the 1990 leg only
+  - Layer 3: Regime computed for EVERY sector (not just Top-3)
+  - Layer 4: 1990 fires only in Top-3 + Strong Uptrend sectors. Bollinger fires in ANY
+             Sideways/Choppy sector, Top-3 or not (see FIX note below).
+
+FIX (validated via combined_system_backtest.py historical replay): a sector strong
+enough to rank in the daily Top-3 by relative strength almost never coincides with
+being Sideways/Choppy at the same time — gating Bollinger by Top-3 membership too
+starved it to just 8 trades in 3 years. Removing that gate for Bollinger only (1990
+keeps it, since 1990 measurably improved with it) raised Bollinger to 75 trades/11
+stocks/66.7% win/+1.45%-per-trade over the same 3 years. This dashboard now matches
+that validated behavior.
 
 FILES NEEDED IN THE SAME FOLDER/REPO:
   - nifty500_stocklist.csv   (symbol, yfinance_symbol, company_name, industry)
@@ -290,11 +299,11 @@ def run_full_scan():
                            text=f"Layer 2: scanning sector {i+1}/{len(sectors_list)}...")
 
     scores.sort(key=lambda x: x["return_pct"], reverse=True)
-    top_sectors = scores[:TOP_N_SECTORS]
+    top_sector_names = {s["sector"] for s in scores[:TOP_N_SECTORS]}
 
-    progress.progress(65, text="Layer 3: detecting regime for top sectors...")
+    progress.progress(65, text="Layer 3: detecting regime for every sector...")
     regime_rows = []
-    for s in top_sectors:
+    for s in scores:
         df = s["df"].copy()
         df["EMA200"] = df["Close"].ewm(span=EMA_TREND_WINDOW, adjust=False).mean()
         df["ADX14"] = compute_adx(df)
@@ -305,20 +314,26 @@ def run_full_scan():
         s["adx"] = round(latest["ADX14"], 2)
         s["slope"] = round(latest["EMA_SLOPE"], 3)
         regime_rows.append({"sector": s["sector"], "relative_strength_%": s["return_pct"],
-                             "adx14": s["adx"], "ema_slope": s["slope"], "regime": regime})
+                             "adx14": s["adx"], "ema_slope": s["slope"], "regime": regime,
+                             "in_top3": s["sector"] in top_sector_names})
 
+    # FIX (validated via combined_system_backtest.py historical replay): a sector strong
+    # enough to rank in the daily Top-3 almost never coincides with being Sideways/Choppy
+    # at the same time — gating Bollinger by Top-3 too starved it to just 8 trades in 3
+    # years. 1990 keeps the Top-3 gate (it measurably improved with it, 0.70%->1.01%/trade).
+    # Bollinger now scans EVERY Sideways/Choppy sector, Top-3 or not.
     progress.progress(75, text="Layer 4: scanning for entries...")
     entries = []
-    for s in top_sectors:
+    for s in scores:
         sector, regime = s["sector"], s["regime"]
-        if regime == "Strong Uptrend":
+        if regime == "Strong Uptrend" and sector in top_sector_names:
             for sym in sector_stocks[sector]:
                 hit = scan_uptrend_stock(sym)
                 if hit:
                     entries.append({"symbol": sym, "sector": sector, "regime": regime,
                                      "strategy": "1990 (RSI2+200EMA)", "entry": hit[0], "stop_loss": hit[1]})
         elif regime == "Sideways/Choppy":
-            for sym in [s for s in sector_stocks[sector] if s in bollinger_ok]:
+            for sym in [st_sym for st_sym in sector_stocks[sector] if st_sym in bollinger_ok]:
                 hit = scan_sideways_stock(sym)
                 if hit:
                     entries.append({"symbol": sym, "sector": sector, "regime": regime,
@@ -329,6 +344,7 @@ def run_full_scan():
 
     return {
         "risk_on": risk_on, "nifty_close": nifty_close, "nifty_ema": nifty_ema,
+        "top_sector_names": sorted(top_sector_names),
         "sector_ranking": pd.DataFrame([{"sector": s["sector"], "return_pct": s["return_pct"]} for s in scores]),
         "regime_table": pd.DataFrame(regime_rows),
         "entries": pd.DataFrame(entries),
@@ -361,7 +377,7 @@ if "result" in st.session_state:
         if r["nifty_close"]:
             st.caption(f"Close: {r['nifty_close']} | 200EMA: {r['nifty_ema']}")
     with col2:
-        st.metric("Layer 2: Top Sectors Today", ", ".join(r["regime_table"]["sector"].tolist()) if not r["regime_table"].empty else "—")
+        st.metric("Layer 2: Top Sectors Today", ", ".join(r["top_sector_names"]) if r["top_sector_names"] else "—")
     with col3:
         st.metric("Layer 4: Entries Found", len(r["entries"]))
 
@@ -371,7 +387,9 @@ if "result" in st.session_state:
     st.subheader("Sector Relative-Strength Ranking (all sectors)")
     st.dataframe(r["sector_ranking"], use_container_width=True, hide_index=True)
 
-    st.subheader("Top 3 Sectors — Today's Regime")
+    st.subheader("Every Sector's Regime Today")
+    st.caption("1990 only fires in Top-3 (✓) sectors that are Strong Uptrend. Bollinger fires in "
+               "ANY Sideways/Choppy sector, Top-3 or not — that's the fix from the historical backtest.")
     st.dataframe(r["regime_table"], use_container_width=True, hide_index=True)
 
     st.subheader("✅ TRADEABLE TODAY")
