@@ -35,10 +35,31 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import datetime
 import warnings
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Market Mood Dashboard", layout="wide")
+st.set_page_config(page_title="Market Mood Dashboard", layout="wide", page_icon="📊")
+
+# ============================== STYLING ==============================
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap');
+html, body, [class*="css"]  { font-family: 'Poppins', sans-serif; }
+.mm-header {
+    background: linear-gradient(90deg, #6a11cb 0%, #2575fc 100%);
+    padding: 28px 32px; border-radius: 16px; margin-bottom: 18px;
+    box-shadow: 0 4px 18px rgba(0,0,0,0.25);
+}
+.mm-header h1 { color: white; margin: 0; font-weight: 700; font-size: 2.1rem; }
+.mm-header p { color: #e8e8ff; margin: 6px 0 0 0; font-size: 0.95rem; }
+.mm-welcome { color: #ffe08a; font-weight: 600; font-size: 1.05rem; }
+.mm-clock { color: white; font-weight: 600; float: right; text-align: right; font-size: 0.9rem; }
+div[data-testid="stMetric"] {
+    background: #ffffff10; border: 1px solid #ffffff25; border-radius: 12px; padding: 10px 14px;
+}
+</style>
+""", unsafe_allow_html=True)
 
 # ============================== TUNABLE PARAMETERS ==============================
 STOCK_LIST_CSV        = "nifty500_stocklist.csv"
@@ -48,6 +69,10 @@ PERIOD                = "3y"
 
 RS_LOOKBACK_DAYS      = 21
 TOP_N_SECTORS         = 3
+
+# Bollinger leg's out-of-sample results haven't held up well enough yet to trust —
+# keep this False until that's re-checked. 1990 is unaffected either way.
+ENABLE_BOLLINGER      = False
 MAX_STOCKS_PER_SECTOR = 15        # kept lower than the Colab version for web-app speed
 
 RSI_PERIOD            = 2
@@ -332,7 +357,7 @@ def run_full_scan():
                 if hit:
                     entries.append({"symbol": sym, "sector": sector, "regime": regime,
                                      "strategy": "1990 (RSI2+200EMA)", "entry": hit[0], "stop_loss": hit[1]})
-        elif regime == "Sideways/Choppy":
+        elif regime == "Sideways/Choppy" and ENABLE_BOLLINGER:
             for sym in [st_sym for st_sym in sector_stocks[sector] if st_sym in bollinger_ok]:
                 hit = scan_sideways_stock(sym)
                 if hit:
@@ -352,10 +377,20 @@ def run_full_scan():
 
 
 # ================================== PAGE LAYOUT ==================================
-st.title("📊 Market Mood Dashboard")
-st.caption("Regime-adaptive scanner — Layer 1 (market filter) → Layer 2 (sector rank) → "
-           "Layer 3 (regime) → Layer 4 (1990 / Bollinger entries). Runs in PARALLEL with 1990 — "
-           "paper-track results before using real money.")
+ist_now = datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
+st.markdown(f"""
+<div class="mm-header">
+    <span class="mm-clock">🕐 {ist_now.strftime('%A, %d %b %Y')}<br>{ist_now.strftime('%I:%M %p')} IST</span>
+    <h1>📊 Market Mood Dashboard</h1>
+    <p class="mm-welcome">Welcome, Kumar 👋</p>
+    <p>Regime-adaptive scanner — Layer 1 (market filter) → Layer 2 (sector rank) →
+    Layer 3 (regime) → Layer 4 (1990{' + Bollinger' if ENABLE_BOLLINGER else ''} entries).
+    Runs in PARALLEL with 1990's own live scanner — paper-track before real money.</p>
+</div>
+""", unsafe_allow_html=True)
+if not ENABLE_BOLLINGER:
+    st.info("ℹ️ Bollinger leg is currently OFF (out-of-sample results not trusted yet) — "
+            "only 1990 entries will show below.")
 
 if st.button("🔍 Run Today's Scan", type="primary"):
     log_df = load_log()
@@ -401,7 +436,14 @@ if "result" in st.session_state:
 
     st.divider()
     st.subheader("📒 Paper Trade Log (all-time, this is how we judge performance)")
+    st.caption("⚠️ This log persists across scans on this SAME running app, but if the app "
+               "restarts or you push a new deploy to GitHub, Streamlit Cloud's free tier can "
+               "wipe this file. **Download a backup regularly** — especially right before pushing "
+               "any code update.")
     log_df = st.session_state.get("log", load_log())
+    if not log_df.empty:
+        st.download_button("⬇️ Download full log (backup)", log_df.to_csv(index=False),
+                            f"market_mood_log_backup_{ist_now.strftime('%Y%m%d')}.csv")
     closed = log_df[log_df["status"] == "CLOSED"]
     open_pos = log_df[log_df["status"] == "OPEN"]
 
