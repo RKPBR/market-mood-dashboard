@@ -70,6 +70,12 @@ PERIOD                = "3y"
 RS_LOOKBACK_DAYS      = 21
 TOP_N_SECTORS         = 3
 
+# nifty500_stocklist.csv has no market-cap/liquidity column, so which stocks represent
+# each sector's index (Layer 2/3) is ranked by avg daily traded value over this many
+# days, instead of "whichever rows happen to come first in the CSV" — same fix already
+# validated in combined_system_backtest.py.
+LIQUIDITY_LOOKBACK_DAYS = 60
+
 # Bollinger leg's out-of-sample results haven't held up well enough yet to trust —
 # keep this False until that's re-checked. 1990 is unaffected either way.
 ENABLE_BOLLINGER      = False
@@ -110,9 +116,32 @@ def fetch_ohlc(symbol, period=PERIOD):
             df.columns = df.columns.get_level_values(0)
         if df.empty or len(df) < EMA_TREND_WINDOW + 20:
             return None
-        return df[["High", "Low", "Close"]]
+        return df[["High", "Low", "Close", "Volume"]]
     except Exception:
         return None
+
+
+def avg_dollar_volume(df, lookback=LIQUIDITY_LOOKBACK_DAYS):
+    """Average (Close x Volume) over the most recent `lookback` rows — liquidity/size
+    proxy computed from the same cached OHLC data, no extra downloads needed."""
+    recent = df.tail(lookback)
+    if "Volume" not in recent.columns or recent["Volume"].isna().all():
+        return 0.0
+    return float((recent["Close"] * recent["Volume"]).mean())
+
+
+def rank_sector_by_liquidity(symbols, top_n):
+    """Replaces symbols[:top_n] (CSV row order) with a liquidity-ranked pick — only
+    affects which stocks build the sector INDEX for Layer 2/3, not which stocks Layer 4
+    scans for actual entries (that already covers every stock in the sector)."""
+    ranked = []
+    for sym in symbols:
+        df = fetch_ohlc(sym)   # cached by st.cache_data — reused for free in Layer 4
+        if df is None:
+            continue
+        ranked.append((sym, avg_dollar_volume(df)))
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in ranked[:top_n]]
 
 
 def compute_adx(df, window=ADX_WINDOW):
@@ -315,7 +344,7 @@ def run_full_scan():
     scores = []
     sectors_list = list(sector_stocks.items())
     for i, (sector, symbols) in enumerate(sectors_list):
-        syms = symbols[:MAX_STOCKS_PER_SECTOR]
+        syms = rank_sector_by_liquidity(symbols, MAX_STOCKS_PER_SECTOR)
         sector_df, used = build_sector_index(syms)
         if sector_df is not None and len(sector_df) > RS_LOOKBACK_DAYS + 5:
             ret = (sector_df["Close"].iloc[-1] / sector_df["Close"].iloc[-RS_LOOKBACK_DAYS] - 1) * 100
