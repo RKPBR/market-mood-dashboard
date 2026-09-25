@@ -219,24 +219,55 @@ def scan_sideways_stock(symbol):
     return None
 
 
-LOG_FILE = "market_mood_log.csv"
+SPREADSHEET_NAME = "market-mood-bot"   # the Google Sheet Kumar created and shared with the service account
 LOG_COLUMNS = ["symbol", "sector", "regime", "strategy", "entry_date", "entry_price",
                "stop_loss", "status", "exit_date", "exit_price", "exit_reason", "pnl_pct", "win"]
 
 
+@st.cache_resource
+def get_gsheet_client():
+    import gspread
+    from google.oauth2.service_account import Credentials
+    scopes = ["https://www.googleapis.com/auth/spreadsheets",
+              "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(dict(st.secrets["gcp_service_account"]), scopes=scopes)
+    return gspread.authorize(creds)
+
+
+def get_worksheet():
+    client = get_gsheet_client()
+    return client.open(SPREADSHEET_NAME).sheet1
+
+
 def load_log():
     try:
-        df = pd.read_csv(LOG_FILE, parse_dates=["entry_date", "exit_date"])
+        ws = get_worksheet()
+        records = ws.get_all_records()
+        if not records:
+            return pd.DataFrame(columns=LOG_COLUMNS)
+        df = pd.DataFrame(records)
         for col in LOG_COLUMNS:
             if col not in df.columns:
                 df[col] = None
+        df["entry_date"] = pd.to_datetime(df["entry_date"], errors="coerce")
+        df["exit_date"] = pd.to_datetime(df["exit_date"], errors="coerce")
         return df[LOG_COLUMNS]
-    except Exception:
+    except Exception as e:
+        st.warning(f"Google Sheet log could not be read ({e}) — starting with an empty log for this view.")
         return pd.DataFrame(columns=LOG_COLUMNS)
 
 
 def save_log(df):
-    df.to_csv(LOG_FILE, index=False)
+    try:
+        ws = get_worksheet()
+        out = df.copy()
+        out["entry_date"] = pd.to_datetime(out["entry_date"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+        out["exit_date"] = pd.to_datetime(out["exit_date"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+        out = out[LOG_COLUMNS].fillna("")
+        ws.clear()
+        ws.update([LOG_COLUMNS] + out.values.tolist())
+    except Exception as e:
+        st.error(f"Could not save to Google Sheet: {e}")
 
 
 def check_exit_1990(symbol, entry_price, stop_loss, entry_date):
@@ -476,13 +507,12 @@ if "result" in st.session_state:
 
     st.divider()
     st.subheader("📒 Paper Trade Log (all-time, this is how we judge performance)")
-    st.caption("⚠️ This log persists across scans on this SAME running app, but if the app "
-               "restarts or you push a new deploy to GitHub, Streamlit Cloud's free tier can "
-               "wipe this file. **Download a backup regularly** — especially right before pushing "
-               "any code update.")
+    st.caption("✅ This log now lives in Google Sheets (\"market-mood-bot\"), not on Streamlit's "
+               "server — it survives redeploys and app restarts. The download button below is "
+               "just an optional extra copy, not required for safety anymore.")
     log_df = st.session_state.get("log", load_log())
     if not log_df.empty:
-        st.download_button("⬇️ Download full log (backup)", log_df.to_csv(index=False),
+        st.download_button("⬇️ Download full log (optional copy)", log_df.to_csv(index=False),
                             f"market_mood_log_backup_{ist_now.strftime('%Y%m%d')}.csv")
     closed = log_df[log_df["status"] == "CLOSED"]
     open_pos = log_df[log_df["status"] == "OPEN"]
