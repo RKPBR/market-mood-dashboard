@@ -70,12 +70,6 @@ PERIOD                = "3y"
 RS_LOOKBACK_DAYS      = 21
 TOP_N_SECTORS         = 3
 
-# nifty500_stocklist.csv has no market-cap/liquidity column, so which stocks represent
-# each sector's index (Layer 2/3) is ranked by avg daily traded value over this many
-# days, instead of "whichever rows happen to come first in the CSV" — same fix already
-# validated in combined_system_backtest.py.
-LIQUIDITY_LOOKBACK_DAYS = 60
-
 # Bollinger leg's out-of-sample results haven't held up well enough yet to trust —
 # keep this False until that's re-checked. 1990 is unaffected either way.
 ENABLE_BOLLINGER      = False
@@ -116,32 +110,9 @@ def fetch_ohlc(symbol, period=PERIOD):
             df.columns = df.columns.get_level_values(0)
         if df.empty or len(df) < EMA_TREND_WINDOW + 20:
             return None
-        return df[["High", "Low", "Close", "Volume"]]
+        return df[["High", "Low", "Close"]]
     except Exception:
         return None
-
-
-def avg_dollar_volume(df, lookback=LIQUIDITY_LOOKBACK_DAYS):
-    """Average (Close x Volume) over the most recent `lookback` rows — liquidity/size
-    proxy computed from the same cached OHLC data, no extra downloads needed."""
-    recent = df.tail(lookback)
-    if "Volume" not in recent.columns or recent["Volume"].isna().all():
-        return 0.0
-    return float((recent["Close"] * recent["Volume"]).mean())
-
-
-def rank_sector_by_liquidity(symbols, top_n):
-    """Replaces symbols[:top_n] (CSV row order) with a liquidity-ranked pick — only
-    affects which stocks build the sector INDEX for Layer 2/3, not which stocks Layer 4
-    scans for actual entries (that already covers every stock in the sector)."""
-    ranked = []
-    for sym in symbols:
-        df = fetch_ohlc(sym)   # cached by st.cache_data — reused for free in Layer 4
-        if df is None:
-            continue
-        ranked.append((sym, avg_dollar_volume(df)))
-    ranked.sort(key=lambda x: x[1], reverse=True)
-    return [s for s, _ in ranked[:top_n]]
 
 
 def compute_adx(df, window=ADX_WINDOW):
@@ -344,7 +315,7 @@ def run_full_scan():
     scores = []
     sectors_list = list(sector_stocks.items())
     for i, (sector, symbols) in enumerate(sectors_list):
-        syms = rank_sector_by_liquidity(symbols, MAX_STOCKS_PER_SECTOR)
+        syms = symbols[:MAX_STOCKS_PER_SECTOR]
         sector_df, used = build_sector_index(syms)
         if sector_df is not None and len(sector_df) > RS_LOOKBACK_DAYS + 5:
             ret = (sector_df["Close"].iloc[-1] / sector_df["Close"].iloc[-RS_LOOKBACK_DAYS] - 1) * 100
@@ -406,15 +377,51 @@ def run_full_scan():
 
 
 # ================================== PAGE LAYOUT ==================================
+# NSE equity-segment trading holidays — source: official NSE 2026 holiday circular.
+# NOTE: this list is only for 2026 — update it each year (NSE publishes the next
+# year's list around December) or "next holiday" will stop finding anything past
+# Dec 25, 2026.
+NSE_HOLIDAYS_2026 = [
+    (datetime.date(2026, 1, 15), "Maharashtra Municipal Corp. Election"),
+    (datetime.date(2026, 1, 26), "Republic Day"),
+    (datetime.date(2026, 3, 3), "Holi"),
+    (datetime.date(2026, 3, 26), "Shri Ram Navami"),
+    (datetime.date(2026, 3, 31), "Shri Mahavir Jayanti"),
+    (datetime.date(2026, 4, 3), "Good Friday"),
+    (datetime.date(2026, 4, 14), "Dr. Baba Saheb Ambedkar Jayanti"),
+    (datetime.date(2026, 5, 1), "Maharashtra Day"),
+    (datetime.date(2026, 5, 28), "Bakri Id"),
+    (datetime.date(2026, 6, 26), "Muharram"),
+    (datetime.date(2026, 9, 14), "Ganesh Chaturthi"),
+    (datetime.date(2026, 10, 2), "Mahatma Gandhi Jayanti"),
+    (datetime.date(2026, 10, 20), "Dussehra"),
+    (datetime.date(2026, 11, 10), "Diwali-Balipratipada"),
+    (datetime.date(2026, 11, 24), "Prakash Gurpurb Sri Guru Nanak Dev"),
+    (datetime.date(2026, 12, 25), "Christmas"),
+]
+
+def get_next_nse_holiday(today):
+    upcoming = [(d, name) for d, name in NSE_HOLIDAYS_2026 if d >= today]
+    return upcoming[0] if upcoming else (None, None)
+
 ist_now = datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
+next_holiday_date, next_holiday_name = get_next_nse_holiday(ist_now.date())
+if next_holiday_date:
+    days_away = (next_holiday_date - ist_now.date()).days
+    holiday_line = (f"📅 Next NSE holiday: {next_holiday_date.strftime('%d %b %Y')} "
+                     f"({next_holiday_name}) — in {days_away} day{'s' if days_away != 1 else ''}")
+else:
+    holiday_line = "📅 Next NSE holiday: update the 2026 list to add next year's dates"
+
 st.markdown(f"""
 <div class="mm-header">
     <span class="mm-clock">🕐 {ist_now.strftime('%A, %d %b %Y')}<br>{ist_now.strftime('%I:%M %p')} IST</span>
     <h1>📊 Market Mood Dashboard</h1>
-    <p class="mm-welcome">Welcome, Kumar 👋</p>
+    <p class="mm-welcome">Welcome, કૌશિક 👋</p>
     <p>Regime-adaptive scanner — Layer 1 (market filter) → Layer 2 (sector rank) →
     Layer 3 (regime) → Layer 4 (1990{' + Bollinger' if ENABLE_BOLLINGER else ''} entries).
     Runs in PARALLEL with 1990's own live scanner — paper-track before real money.</p>
+    <p style="margin-top:8px;">{holiday_line}</p>
 </div>
 """, unsafe_allow_html=True)
 if not ENABLE_BOLLINGER:
@@ -448,13 +455,17 @@ if "result" in st.session_state:
     if not r["risk_on"]:
         st.warning("Nifty50 is below its 200EMA — Master Plan says lean toward cash / reduce size today.")
 
-    st.subheader("Sector Relative-Strength Ranking (all sectors)")
-    st.dataframe(r["sector_ranking"], use_container_width=True, hide_index=True)
+    st.subheader("🏆 Top 3 Sectors Today")
+    st.caption("1990 fires in these if Strong Uptrend. Bollinger also fires in ANY other "
+               "Sideways/Choppy sector below, Top-3 or not.")
+    top3_table = r["regime_table"][r["regime_table"]["in_top3"] == True] \
+        .sort_values("relative_strength_%", ascending=False) \
+        .drop(columns=["in_top3"])
+    st.dataframe(top3_table, use_container_width=True, hide_index=True)
 
-    st.subheader("Every Sector's Regime Today")
-    st.caption("1990 only fires in Top-3 (✓) sectors that are Strong Uptrend. Bollinger fires in "
-               "ANY Sideways/Choppy sector, Top-3 or not — that's the fix from the historical backtest.")
-    st.dataframe(r["regime_table"], use_container_width=True, hide_index=True)
+    with st.expander("બધા 18 sectors જોવા (વિગતવાર)"):
+        st.dataframe(r["regime_table"].sort_values("relative_strength_%", ascending=False),
+                     use_container_width=True, hide_index=True)
 
     st.subheader("✅ TRADEABLE TODAY")
     if r["entries"].empty:
