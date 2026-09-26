@@ -186,6 +186,16 @@ html,body,.stApp,[class*="css"]{font-family:'Manrope','Noto Sans Gujarati',sans-
 .mm-foot b{color:var(--text);}
 .mm-foot a{color:var(--lav);}
 .mm-note{color:var(--muted);font-size:12px;margin-top:10px;}
+.mm-tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:16px;margin-top:4px;}
+.mm-table{width:100%;border-collapse:collapse;font-size:13px;color:var(--text);}
+.mm-table th{background:#202028;color:var(--muted);font-weight:600;text-align:left;padding:10px 12px;white-space:nowrap;}
+.mm-table td{padding:9px 12px;border-top:1px solid var(--line);white-space:nowrap;color:var(--text);}
+.mm-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:14px 0;}
+@media (max-width:760px){.mm-stats{grid-template-columns:1fr;}}
+.mm-rules,.mm-rules p,.mm-rules li{color:var(--text);font-size:14px;line-height:1.6;}
+.mm-rules h4{color:var(--text);font-weight:600;font-size:18px;margin:0 0 10px 0;}
+.mm-rules b{color:var(--lav);}
+[data-testid="stSpinner"],[data-testid="stSpinner"] *{color:var(--text)!important;}
 div[data-testid="stAlert"]{border-radius:16px;}
 </style>
 """, unsafe_allow_html=True)
@@ -827,58 +837,104 @@ with tab_over:
     with g:
         st.markdown(card_positions(res, log), unsafe_allow_html=True)
 
+STATUS_TEXT = {"PENDING": "buy at next open", "OPEN": "holding", "EXIT_PENDING": "sell at next open",
+               "CLOSED": "closed", "SKIPPED": "not bought"}
+
+
+def html_table(df):
+    head = "".join(f"<th>{esc(c)}</th>" for c in df.columns)
+    body = "".join("<tr>" + "".join(f"<td>{esc(v)}</td>" for v in row) + "</tr>"
+                   for row in df.itertuples(index=False))
+    return f'<div class="mm-tablewrap"><table class="mm-table"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+
+
+def fmt_num(x, dec=2):
+    v = _num(x)
+    return indian(v, dec) if np.isfinite(v) else ""
+
+
+def fmt_pct(x):
+    v = _num(x)
+    return f"{v:+.2f}%" if np.isfinite(v) else ""
+
+
 with tab_pos:
-    view = (log.copy() if log is not None else pd.DataFrame(columns=LOG_COLS)).astype(str)
-    view["symbol"] = view["symbol"].map(short)
+    view = log.copy() if log is not None else pd.DataFrame(columns=LOG_COLS)
     live = view[view["status"].isin(["PENDING", "OPEN", "EXIT_PENDING"])]
     done = view[view["status"].isin(["CLOSED", "SKIPPED"])]
-    st.markdown("#### Current positions")
+    html_out = ['<div class="mm-card"><div class="mm-h"><span class="mm-t">Current positions</span></div>']
     if len(live):
-        st.dataframe(live, hide_index=True, width="stretch")
+        t = pd.DataFrame({
+            "Stock": live["symbol"].map(short), "Sector": live["sector"],
+            "Status": live["status"].map(lambda x: STATUS_TEXT.get(x, x)),
+            "Shares": live["qty"], "Bought on": live["entry_date"].map(lambda x: pretty_date(x) if x else ""),
+            "Buy price": live["entry_price"].map(fmt_num), "Stop-loss": live["stop_loss"].map(fmt_num),
+            "P&L now": live["pnl_pct"].map(fmt_pct),
+            "Sell reason": live["exit_reason"].map(lambda x: REASON_TEXT.get(x, x))})
+        html_out.append(html_table(t))
     else:
-        st.caption("No open or pending positions.")
-    st.markdown("#### Closed trades")
+        html_out.append('<div class="mm-empty">No open or pending positions.</div>')
+    html_out.append("</div>")
+    cl = done[done["status"] == "CLOSED"]
+    pnl = pd.to_numeric(cl["pnl_rs"], errors="coerce")
+    wins = f"{100 * (pnl > 0).mean():.0f}%" if len(cl) else "—"
+    net = inr(pnl.sum()) if len(cl) else "—"
+    html_out.append(f"""<div class="mm-stats">
+<div class="mm-card"><div class="mm-sub">Closed trades</div><div class="mm-big" style="font-size:34px">{len(cl)}</div></div>
+<div class="mm-card"><div class="mm-sub">Winning trades</div><div class="mm-big" style="font-size:34px">{wins}</div></div>
+<div class="mm-card"><div class="mm-sub">Net profit after costs</div><div class="mm-big" style="font-size:34px">{net}</div></div>
+</div>""")
+    html_out.append('<div class="mm-card"><div class="mm-h"><span class="mm-t">Closed trades</span></div>')
     if len(done):
-        cl = done[done["status"] == "CLOSED"]
-        pnl = pd.to_numeric(cl["pnl_rs"], errors="coerce")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Closed trades", len(cl))
-        m2.metric("Winning trades", f"{100 * (pnl > 0).mean():.0f}%" if len(cl) else "—")
-        m3.metric("Net profit (after costs)", inr(pnl.sum()) if len(cl) else "—")
-        st.dataframe(done.iloc[::-1], hide_index=True, width="stretch")
+        d2 = done.iloc[::-1]
+        t = pd.DataFrame({
+            "Stock": d2["symbol"].map(short), "Result": d2["status"].map(lambda x: STATUS_TEXT.get(x, x)),
+            "Bought on": d2["entry_date"].map(lambda x: pretty_date(x) if x else ""),
+            "Buy price": d2["entry_price"].map(fmt_num),
+            "Sold on": d2["exit_date"].map(lambda x: pretty_date(x) if x else ""),
+            "Sell price": d2["exit_price"].map(fmt_num),
+            "Reason": d2["exit_reason"].map(lambda x: REASON_TEXT.get(x, x)),
+            "P&L": d2["pnl_pct"].map(fmt_pct),
+            "P&L ₹": d2["pnl_rs"].map(lambda x: inr(_num(x)) if np.isfinite(_num(x)) else "")})
+        html_out.append(html_table(t))
     else:
-        st.caption("No closed trades yet.")
-    st.caption("The log lives in the Google Sheet 'market-mood-bot', tab 'system_log_v1'. It follows the frozen "
-               "rules exactly; if you skip a trade in real life, delete its row there.")
+        html_out.append('<div class="mm-empty">No closed trades yet.</div>')
+    html_out.append('<div class="mm-note">The log lives in the Google Sheet "market-mood-bot", tab "system_log_v1". '
+                    'It follows the frozen rules exactly; if you skip a trade in real life, delete its row there.</div></div>')
+    st.markdown("".join(html_out), unsafe_allow_html=True)
 
 with tab_sec:
     if res:
-        st.dataframe(res["sectors"], hide_index=True, width="stretch")
-        st.caption("Buys are allowed only in sectors ranked 1 or 2 that are also in a strong uptrend "
-                   "(ADX above 25 and a rising 200-day average).")
+        t = res["sectors"].copy()
+        t["Rank"] = t["Rank"].map(lambda x: "" if pd.isna(x) else int(x))
+        t["21-day move %"] = t["21-day move %"].map(lambda x: "" if pd.isna(x) else f"{x:+.2f}%")
+        t["ADX"] = t["ADX"].map(lambda x: "" if pd.isna(x) else f"{x:.1f}")
+        st.markdown('<div class="mm-card"><div class="mm-h"><span class="mm-t">All sectors</span>'
+                    f'<span class="mm-chip">Close {res["as_of"].strftime("%d %b %Y")}</span></div>'
+                    + html_table(t) +
+                    '<div class="mm-note">Buys are allowed only in sectors ranked 1 or 2 that are also in a strong '
+                    'uptrend (ADX above 25 and a rising 200-day average).</div></div>', unsafe_allow_html=True)
     else:
-        st.caption("Run today's scan to see all sectors.")
+        st.markdown('<div class="mm-card"><div class="mm-empty">Run today\'s scan to see all sectors.</div></div>',
+                    unsafe_allow_html=True)
 
 with tab_rules:
-    st.markdown("""
-#### Frozen rules v1 (26 Sep 2026)
-**When to buy** (checked after the close, bought at the next day's open):
-1. Nifty 50 closes above its 200-day average (risk-on).
-2. Nifty 50 closes 0.5% or more below the previous close (a market-wide dip).
-3. The stock's sector ranks 1 or 2 by 21-day strength and is in a strong uptrend.
-4. The stock closes above its 200-day average with RSI(2) below 10.
-
-**How much:** 6 slots of ₹25,000. Share count = ₹25,000 ÷ signal-day close. When more stocks qualify than
-free slots, the stronger sector goes first, then the lower RSI(2).
-
-**When to sell** (whichever comes first):
-1. Stop-loss = signal-day close − 2 × ATR(14), active from the day of purchase (GTT order).
-2. RSI(2) above 70, or a close above the 5-day average → sell at the next open.
-3. Still holding after 10 trading days → sell at the next open.
-
-**Test results before going live** (costs included): 2016–2023 locked test, never used to build the rules:
-493 trades, +0.77% per trade, 6.6% a year, largest fall 9.4% (Nifty's was 38.4%). All pass criteria met.
-Past and tested results do not guarantee future returns.
-""")
+    st.markdown("""<div class="mm-card mm-rules">
+<h4>Frozen rules v1 (26 Sep 2026)</h4>
+<p><b>When to buy</b> (checked after the close, bought at the next day's open):</p>
+<ol><li>Nifty 50 closes above its 200-day average (risk-on).</li>
+<li>Nifty 50 closes 0.5% or more below the previous close (a market-wide dip).</li>
+<li>The stock's sector ranks 1 or 2 by 21-day strength and is in a strong uptrend.</li>
+<li>The stock closes above its 200-day average with RSI(2) below 10.</li></ol>
+<p><b>How much:</b> 6 slots of ₹25,000. Share count = ₹25,000 ÷ signal-day close. When more stocks qualify than
+free slots, the stronger sector goes first, then the lower RSI(2).</p>
+<p><b>When to sell</b> (whichever comes first):</p>
+<ol><li>Stop-loss = signal-day close − 2 × ATR(14), active from the day of purchase (GTT order).</li>
+<li>RSI(2) above 70, or a close above the 5-day average: sell at the next open.</li>
+<li>Still holding after 10 trading days: sell at the next open.</li></ol>
+<p><b>Test results before going live</b> (costs included): the 2016–2023 locked test, never used to build the rules,
+gave 493 trades, +0.77% per trade, 6.6% a year and a largest fall of 9.4% (Nifty's was 38.4%). All pass criteria
+were met. Past and tested results do not guarantee future returns.</p>
+</div>""", unsafe_allow_html=True)
 
 st.markdown(FOOTER, unsafe_allow_html=True)
