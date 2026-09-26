@@ -1,544 +1,884 @@
 """
-Market Mood Dashboard — single-page Streamlit app
-====================================================
-Consolidates everything into ONE page, like the RSI2 dashboard:
-  - Layer 1: Nifty50 market filter
-  - Layer 2: Sector ranking (relative strength) — Top-3 used to gate the 1990 leg only
-  - Layer 3: Regime computed for EVERY sector (not just Top-3)
-  - Layer 4: 1990 fires only in Top-3 + Strong Uptrend sectors. Bollinger fires in ANY
-             Sideways/Choppy sector, Top-3 or not (see FIX note below).
+Market Mood dashboard — Frozen rules v1 (26 Sep 2026)
 
-FIX (validated via combined_system_backtest.py historical replay): a sector strong
-enough to rank in the daily Top-3 by relative strength almost never coincides with
-being Sideways/Choppy at the same time — gating Bollinger by Top-3 membership too
-starved it to just 8 trades in 3 years. Removing that gate for Bollinger only (1990
-keeps it, since 1990 measurably improved with it) raised Bollinger to 75 trades/11
-stocks/66.7% win/+1.45%-per-trade over the same 3 years. This dashboard now matches
-that validated behavior.
+Every evening after 4:00 pm IST, "Run today's scan":
+  1. downloads 5 years of daily prices for the current Nifty 500 + Nifty 50 (yfinance),
+  2. runs the SAME frozen engine that passed the LOCKED test (mm_frozen.py),
+  3. updates the system log (Google Sheet "market-mood-bot", tab "system_log_v1"),
+  4. shows tomorrow's orders: BUY (with share count and stop-loss) and SELL.
 
-FILES NEEDED IN THE SAME FOLDER/REPO:
-  - nifty500_stocklist.csv   (symbol, yfinance_symbol, company_name, industry)
-  - bollinger_tradeable.csv  (the 20 validated Sideways-regime stocks)
-
-DEPLOY THE SAME WAY YOU DEPLOYED THE RSI2 DASHBOARD:
-  1. Put this file + the 2 CSVs + a requirements.txt (streamlit, pandas, numpy, yfinance)
-     into a GitHub repo (a new one, or a new folder in your existing rsi2-dashboard repo).
-  2. Go to share.streamlit.io, point it at this file, deploy.
-  3. Open the link -> click "Run Today's Scan" -> everything shows on one page.
-
-NOTE ON SPEED: scanning ~500 stocks + building 18 sector indices takes a few minutes
-(same as it did in Colab). MAX_STOCKS_PER_SECTOR below keeps it from being too slow —
-raise it later once you're comfortable with the runtime.
+Files needed in the repo: market_mood_app.py, mm_frozen.py, nifty500_current.csv,
+requirements.txt, .streamlit/config.toml. Google credentials stay in Streamlit Secrets.
 """
-
-import streamlit as st
-import pandas as pd
-import numpy as np
-import yfinance as yf
-import datetime
+import datetime as dt
+import html
+import logging
+import os
+import time
 import warnings
-warnings.filterwarnings("ignore")
+from zoneinfo import ZoneInfo
 
-st.set_page_config(page_title="Market Mood Dashboard", layout="wide", page_icon="📊")
+import numpy as np
+import pandas as pd
+import streamlit as st
+import streamlit.components.v1 as components
 
-# ============================== STYLING ==============================
+import mm_frozen as F
+
+warnings.filterwarnings("ignore", category=RuntimeWarning)   # empty-sector means on early dates
+
+st.set_page_config(page_title="Market Mood", page_icon="🟣", layout="wide",
+                   initial_sidebar_state="collapsed")
+
+# ------------------------------------------------------------------ settings
+OWNER = "Kaushik J. Tanna"
+EMAIL = "kj.tanna@gmail.com"
+IST = ZoneInfo("Asia/Kolkata")
+LIST_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nifty500_current.csv")
+SPREADSHEET_NAME = "market-mood-bot"
+LOG_TAB = "system_log_v1"
+HISTORY_YEARS = 5
+MARKET_OPEN, MARKET_CLOSE, SCAN_AFTER = dt.time(9, 15), dt.time(15, 30), dt.time(16, 0)
+GTT_LIMIT_BELOW = 0.05          # GTT limit price 5% below the trigger, so gap-downs still fill
+
+# NSE equity holidays 2026 (official circular). Add the 2027 list when NSE publishes it in December.
+NSE_HOLIDAYS = {
+    dt.date(2026, 1, 15): "Maharashtra municipal election", dt.date(2026, 1, 26): "Republic Day",
+    dt.date(2026, 3, 3): "Holi", dt.date(2026, 3, 26): "Shri Ram Navami",
+    dt.date(2026, 3, 31): "Shri Mahavir Jayanti", dt.date(2026, 4, 3): "Good Friday",
+    dt.date(2026, 4, 14): "Dr. Baba Saheb Ambedkar Jayanti", dt.date(2026, 5, 1): "Maharashtra Day",
+    dt.date(2026, 5, 28): "Bakri Id", dt.date(2026, 6, 26): "Muharram",
+    dt.date(2026, 9, 14): "Ganesh Chaturthi", dt.date(2026, 10, 2): "Mahatma Gandhi Jayanti",
+    dt.date(2026, 10, 20): "Dussehra", dt.date(2026, 11, 10): "Diwali Balipratipada",
+    dt.date(2026, 11, 24): "Guru Nanak Jayanti", dt.date(2026, 12, 25): "Christmas",
+}
+
+LOG_COLS = ["symbol", "sector", "signal_date", "qty", "stop_loss", "status", "entry_date",
+            "entry_price", "exit_date", "exit_price", "exit_reason", "pnl_pct", "pnl_rs"]
+
+# test hooks (never set on Streamlit Cloud)
+TEST_PARQUET = os.environ.get("MM_TEST_PARQUET")
+TEST_NOW = os.environ.get("MM_TEST_NOW")
+TEST_LOG = os.environ.get("MM_TEST_LOG")
+
+
+def now_ist():
+    return pd.Timestamp(TEST_NOW, tz=IST) if TEST_NOW else pd.Timestamp.now(tz=IST)
+
+
+def is_trading_day(d):
+    return d.weekday() < 5 and d not in NSE_HOLIDAYS
+
+
+def next_trading_day(d):
+    d = d + dt.timedelta(days=1)
+    while not is_trading_day(d):
+        d += dt.timedelta(days=1)
+    return d
+
+
+def indian(x, dec=0):
+    """1,50,000 style grouping."""
+    neg = x < 0
+    s = f"{abs(x):.{dec}f}"
+    whole, _, frac = s.partition(".")
+    if len(whole) > 3:
+        head, tail = whole[:-3], whole[-3:]
+        groups = []
+        while len(head) > 2:
+            groups.insert(0, head[-2:])
+            head = head[:-2]
+        if head:
+            groups.insert(0, head)
+        whole = ",".join(groups) + "," + tail
+    return ("-" if neg else "") + whole + ("." + frac if frac else "")
+
+
+def inr(x, dec=0):
+    return ("-₹" if x < 0 else "₹") + indian(abs(x), dec)
+
+
+def esc(s):
+    return html.escape(str(s))
+
+
+def short(sym):
+    return str(sym).replace(".NS", "")
+
+
+REASON_TEXT = {"RSI2>70": "RSI(2) above 70", "Close>SMA5": "close above 5-day average",
+               "MaxHold": "10-day limit reached", "SL": "stop-loss", "SL_gap": "stop-loss, gap down"}
+
+
+def pretty_date(x):
+    try:
+        return pd.Timestamp(x).strftime("%d %b")
+    except (TypeError, ValueError):
+        return str(x)
+
+
+# ------------------------------------------------------------------ style
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap');
-html, body, [class*="css"]  { font-family: 'Poppins', sans-serif; }
-.mm-header {
-    background: linear-gradient(90deg, #6a11cb 0%, #2575fc 100%);
-    padding: 28px 32px; border-radius: 16px; margin-bottom: 18px;
-    box-shadow: 0 4px 18px rgba(0,0,0,0.25);
-}
-.mm-header h1 { color: white; margin: 0; font-weight: 700; font-size: 2.1rem; }
-.mm-header p { color: #e8e8ff; margin: 6px 0 0 0; font-size: 0.95rem; }
-.mm-welcome { color: #ffe08a; font-weight: 600; font-size: 1.05rem; }
-.mm-clock { color: white; font-weight: 600; float: right; text-align: right; font-size: 0.9rem; }
-div[data-testid="stMetric"] {
-    background: #ffffff10; border: 1px solid #ffffff25; border-radius: 12px; padding: 10px 14px;
-}
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700&family=Noto+Sans+Gujarati:wght@400;600&display=swap');
+:root{--ink:#0E0E12;--card:#18181E;--line:#26262F;--lav:#C9B8FF;--butter:#F3E28C;--sky:#9FD4FF;
+--mint:#8BE3B4;--coral:#FF9C8A;--text:#F5F4F8;--muted:#8E8C9B;}
+html,body,.stApp,[class*="css"]{font-family:'Manrope','Noto Sans Gujarati',sans-serif;}
+.stApp{background:linear-gradient(135deg,#DCD3FF 0%,#C9D8FF 55%,#E4D7FF 100%);}
+[data-testid="stHeader"]{background:transparent;}
+#MainMenu,footer{visibility:hidden;}
+.block-container,[data-testid="stMainBlockContainer"]{background:var(--ink);border-radius:30px;
+  max-width:1320px;margin:22px auto 30px auto;padding:26px 30px 30px 30px !important;
+  box-shadow:0 30px 80px rgba(40,20,90,.35);}
+@media (max-width:760px){.block-container,[data-testid="stMainBlockContainer"]{margin:0;border-radius:0;padding:16px 14px !important;}}
+.mm-brand{font-size:30px;font-weight:600;letter-spacing:-.02em;color:var(--text);line-height:1;padding-top:6px;}
+.mm-brand small{display:block;font-size:13px;font-weight:400;color:var(--muted);letter-spacing:0;margin-top:6px;}
+.mm-profile{display:flex;align-items:center;gap:12px;justify-content:flex-end;background:var(--card);
+  border:1px solid var(--line);border-radius:999px;padding:7px 18px 7px 8px;width:fit-content;margin-left:auto;}
+.mm-avatar{width:40px;height:40px;border-radius:50%;background:var(--lav);color:var(--ink);display:flex;
+  align-items:center;justify-content:center;font-weight:700;font-size:15px;}
+.mm-pname{color:var(--text);font-weight:600;font-size:15px;line-height:1.1;}
+.mm-pmail{color:var(--muted);font-size:12px;}
+.mm-pmail a{color:var(--muted);text-decoration:none;}
+.stButton>button{background:var(--lav)!important;color:var(--ink)!important;border:none!important;
+  border-radius:999px!important;font-weight:700!important;padding:.62rem 1.2rem!important;}
+.stButton>button:hover{filter:brightness(1.06);}
+.stButton>button:focus-visible{outline:3px solid var(--butter)!important;}
+.stTabs [data-baseweb="tab-list"]{gap:4px;background:var(--card);border:1px solid var(--line);border-radius:999px;
+  padding:5px;width:fit-content;margin:6px 0 14px 0;}
+.stTabs [data-baseweb="tab"]{border-radius:999px;padding:8px 20px;color:var(--muted);background:transparent;height:auto;}
+.stTabs [aria-selected="true"]{background:var(--text)!important;color:var(--ink)!important;}
+.stTabs [data-baseweb="tab-highlight"],.stTabs [data-baseweb="tab-border"]{display:none;}
+.mm-card{background:var(--card);border:1px solid var(--line);border-radius:24px;padding:20px 22px;min-height:100%;}
+.mm-card.tall{min-height:410px;}
+.mm-card.mid{min-height:360px;}
+.mm-h{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;}
+.mm-t{color:var(--text);font-weight:600;font-size:16px;}
+.mm-chip{border:1px solid var(--line);color:var(--muted);border-radius:999px;padding:4px 12px;font-size:12px;}
+.mm-big{color:var(--text);font-weight:300;font-size:46px;letter-spacing:-.03em;line-height:1;}
+.mm-sub{color:var(--muted);font-size:13px;margin-top:6px;}
+.b-up,.b-dn,.b-lav,.b-but{display:inline-block;border-radius:9px;padding:3px 9px;font-size:12px;font-weight:700;color:var(--ink);}
+.b-up{background:var(--mint);} .b-dn{background:var(--coral);} .b-lav{background:var(--lav);} .b-but{background:var(--butter);}
+.mm-verdict{margin-top:14px;padding:12px 14px;border-radius:16px;background:#202028;color:var(--text);font-size:14px;}
+.mm-verdict b{color:var(--lav);}
+.mm-row{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:16px;background:#202028;margin-bottom:8px;}
+.mm-row .grow{flex:1;min-width:0;}
+.mm-row .nm{color:var(--text);font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.mm-row .dt{color:var(--muted);font-size:12px;}
+.mm-row .val{background:#2A2A33;color:var(--text);border-radius:12px;padding:8px 10px;font-size:13px;font-weight:600;text-align:right;white-space:nowrap;}
+.mm-empty{color:var(--muted);font-size:14px;padding:18px 4px;line-height:1.5;}
+.mm-slots{display:flex;align-items:flex-end;gap:10px;height:230px;margin-top:8px;}
+.mm-slot{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;}
+.mm-slot .bar{width:100%;border-radius:14px;}
+.mm-slot .lab{color:var(--muted);font-size:11px;margin-top:8px;white-space:nowrap;}
+.mm-slot .top{color:var(--text);font-size:11px;font-weight:700;margin-bottom:6px;background:#2A2A33;border-radius:8px;padding:2px 6px;}
+.bar.open{background:var(--lav);} .bar.sell{background:var(--butter);}
+.bar.buy{background:repeating-linear-gradient(135deg,var(--butter) 0 6px,#3a3726 6px 11px);}
+.bar.free{background:repeating-linear-gradient(135deg,#2c2c35 0 6px,#1d1d23 6px 11px);height:34%;}
+.mm-legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:12px;color:var(--muted);font-size:12px;}
+.mm-legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px;}
+.mm-bubbles{position:relative;height:250px;}
+.mm-bub{position:absolute;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  color:var(--ink);text-align:center;padding:10px;}
+.mm-bub b{font-weight:600;letter-spacing:-.02em;}
+.mm-bub span{font-size:11px;line-height:1.2;}
+.mm-foot{margin-top:26px;padding:18px 22px;border-radius:20px;border:1px solid var(--line);color:var(--muted);font-size:12.5px;line-height:1.6;}
+.mm-foot b{color:var(--text);}
+.mm-foot a{color:var(--lav);}
+.mm-note{color:var(--muted);font-size:12px;margin-top:10px;}
+div[data-testid="stAlert"]{border-radius:16px;}
 </style>
 """, unsafe_allow_html=True)
 
-# ============================== TUNABLE PARAMETERS ==============================
-STOCK_LIST_CSV        = "nifty500_stocklist.csv"
-TRADEABLE_BOLLINGER   = "bollinger_tradeable.csv"
-NIFTY50_TICKER        = "^NSEI"
-PERIOD                = "3y"
 
-RS_LOOKBACK_DAYS      = 21
-TOP_N_SECTORS         = 3
-
-# Bollinger leg's out-of-sample results haven't held up well enough yet to trust —
-# keep this False until that's re-checked. 1990 is unaffected either way.
-ENABLE_BOLLINGER      = False
-MAX_STOCKS_PER_SECTOR = 15        # kept lower than the Colab version for web-app speed
-
-RSI_PERIOD            = 2
-RSI_ENTRY_MAX         = 10
-EMA_TREND_WINDOW      = 200
-ADX_WINDOW            = 14
-ATR_WINDOW            = 14
-ATR_SL_MULT           = 2.0
-
-BB_WINDOW             = 20
-BB_NDEV               = 1.5
-ADX_STRONG            = 25
-ADX_SIDEWAYS          = 20
-# ==================================================================================
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_universe():
-    return pd.read_csv(STOCK_LIST_CSV)
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_bollinger_list():
+# ------------------------------------------------------------------ data
+def _extract(data, t):
+    if data is None or len(data) == 0:
+        return None
     try:
-        return set(pd.read_csv(TRADEABLE_BOLLINGER)["symbol"].tolist())
-    except Exception:
-        return set()
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_ohlc(symbol, period=PERIOD):
-    try:
-        df = yf.download(symbol, period=period, interval="1d", progress=False, auto_adjust=True)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        if df.empty or len(df) < EMA_TREND_WINDOW + 20:
+        if isinstance(data.columns, pd.MultiIndex):
+            if t in data.columns.get_level_values(0):
+                sub = data.xs(t, axis=1, level=0)
+            elif t in data.columns.get_level_values(1):
+                sub = data.xs(t, axis=1, level=1)
+            else:
+                return None
+        else:
+            sub = data
+        sub = sub.rename(columns={"Adj Close": "AdjClose"})
+        need = ["Open", "High", "Low", "Close", "AdjClose", "Volume"]
+        if any(c not in sub.columns for c in need):
             return None
-        return df[["High", "Low", "Close"]]
+        sub = sub[need].copy()
+        sub = sub[sub["Close"].notna()]
+        if len(sub) == 0:
+            return None
+        idx = pd.DatetimeIndex(pd.to_datetime(sub.index))
+        if idx.tz is not None:
+            idx = idx.tz_localize(None)
+        sub.index = idx.normalize()
+        sub = sub[~sub.index.duplicated(keep="last")]
+        sub.index.name = "Date"
+        sub = sub.reset_index()
+        sub.insert(1, "Ticker", t)
+        return sub
     except Exception:
         return None
 
 
-def compute_adx(df, window=ADX_WINDOW):
-    high, low, close = df["High"], df["Low"], df["Close"]
-    prev_close, prev_high, prev_low = close.shift(1), high.shift(1), low.shift(1)
-    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    up_move, down_move = high - prev_high, prev_low - low
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    atr = tr.ewm(alpha=1/14, adjust=False).mean()
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1/14, adjust=False).mean() / atr
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1/14, adjust=False).mean() / atr
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
-    return dx.ewm(alpha=1/14, adjust=False).mean()
+@st.cache_data(ttl=3 * 3600, show_spinner=False)
+def load_prices(tickers, start, end, session_tag):
+    """session_tag separates before-close and after-close downloads of the same day."""
+    if TEST_PARQUET:
+        w = pd.read_parquet(TEST_PARQUET)
+        return w[(w["Date"] >= start) & (w["Date"] < end) & (w["Ticker"].isin(tickers))].copy()
+    import yfinance as yf
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
-
-def compute_rsi(close, period=RSI_PERIOD):
-    delta = close.diff()
-    gain, loss = delta.clip(lower=0), -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-def compute_atr(df, window=ATR_WINDOW):
-    high, low, close = df["High"], df["Low"], df["Close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    return tr.rolling(window).mean()
-
-
-def classify_regime(adx, slope):
-    if pd.isna(adx) or pd.isna(slope):
+    def fetch(batch):
+        for attempt in range(3):
+            try:
+                return yf.download(list(batch), start=start, end=end, interval="1d", auto_adjust=False,
+                                   actions=False, group_by="ticker", threads=True, progress=False)
+            except Exception:
+                time.sleep(5 * (attempt + 1))
         return None
-    if adx > ADX_STRONG and slope > 0:
-        return "Strong Uptrend"
-    if adx > ADX_STRONG and slope < 0:
-        return "Strong Downtrend"
-    if adx < ADX_SIDEWAYS:
-        return "Sideways/Choppy"
-    return "Transitional"
+
+    tickers = list(tickers)
+    frames, got = [], set()
+    for i in range(0, len(tickers), 50):
+        batch = tickers[i:i + 50]
+        data = fetch(batch)
+        for t in batch:
+            sub = _extract(data, t)
+            if sub is not None:
+                frames.append(sub)
+                got.add(t)
+        time.sleep(0.5)
+    for t in [t for t in tickers if t not in got][:40]:
+        sub = _extract(fetch([t]), t)
+        if sub is not None:
+            frames.append(sub)
+            got.add(t)
+    if not frames:
+        return pd.DataFrame(columns=["Date", "Ticker", "Open", "High", "Low", "Close", "AdjClose", "Volume"])
+    return pd.concat(frames, ignore_index=True)
 
 
-def build_sector_index(symbols):
-    highs, lows, closes = [], [], []
-    used = 0
-    for sym in symbols:
-        ohlc = fetch_ohlc(sym)
-        if ohlc is None:
-            continue
-        base = ohlc["Close"].iloc[0]
-        if base <= 0 or pd.isna(base):
-            continue
-        highs.append(ohlc["High"] / base * 100)
-        lows.append(ohlc["Low"] / base * 100)
-        closes.append(ohlc["Close"] / base * 100)
-        used += 1
-    if used < 3:
-        return None, used
-    sector_df = pd.DataFrame({
-        "High": pd.concat(highs, axis=1).mean(axis=1),
-        "Low": pd.concat(lows, axis=1).mean(axis=1),
-        "Close": pd.concat(closes, axis=1).mean(axis=1),
-    }).dropna()
-    return sector_df, used
+@st.cache_data(show_spinner=False)
+def load_universe():
+    cur = pd.read_csv(LIST_CSV)
+    return cur[~cur["symbol"].astype(str).str.upper().str.startswith("DUMMY")].reset_index(drop=True)
 
 
-def layer1_market_filter():
-    nifty = fetch_ohlc(NIFTY50_TICKER)
-    if nifty is None:
-        return True, None, None
-    ema200 = nifty["Close"].ewm(span=EMA_TREND_WINDOW, adjust=False).mean()
-    last_close, last_ema = nifty["Close"].iloc[-1], ema200.iloc[-1]
-    return last_close > last_ema, round(last_close, 1), round(last_ema, 1)
+# ------------------------------------------------------------------ system log (Google Sheet)
+def _clean_log(df):
+    for c in LOG_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[LOG_COLS].copy().astype(object)
+    return df.where(df.notna(), "")
 
 
-def scan_uptrend_stock(symbol):
-    df = fetch_ohlc(symbol)
-    if df is None:
-        return None
-    close = df["Close"]
-    ema200 = close.ewm(span=EMA_TREND_WINDOW, adjust=False).mean()
-    rsi2 = compute_rsi(close)
-    atr = compute_atr(df)
-    if close.iloc[-1] > ema200.iloc[-1] and rsi2.iloc[-1] < RSI_ENTRY_MAX:
-        entry = close.iloc[-1]
-        return round(entry, 2), round(entry - ATR_SL_MULT * atr.iloc[-1], 2)
-    return None
-
-
-def scan_sideways_stock(symbol):
-    df = fetch_ohlc(symbol)
-    if df is None:
-        return None
-    close = df["Close"]
-    mid = close.rolling(BB_WINDOW).mean()
-    std = close.rolling(BB_WINDOW).std()
-    lower = mid - BB_NDEV * std
-    atr = compute_atr(df)
-    if close.iloc[-1] < lower.iloc[-1]:
-        entry = close.iloc[-1]
-        return round(entry, 2), round(entry - ATR_SL_MULT * atr.iloc[-1], 2)
-    return None
-
-
-SPREADSHEET_NAME = "market-mood-bot"   # the Google Sheet Kumar created and shared with the service account
-LOG_COLUMNS = ["symbol", "sector", "regime", "strategy", "entry_date", "entry_price",
-               "stop_loss", "status", "exit_date", "exit_price", "exit_reason", "pnl_pct", "win"]
-
-
-@st.cache_resource
-def get_gsheet_client():
+@st.cache_resource(show_spinner=False)
+def _worksheet():
     import gspread
     from google.oauth2.service_account import Credentials
-    scopes = ["https://www.googleapis.com/auth/spreadsheets",
-              "https://www.googleapis.com/auth/drive"]
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(dict(st.secrets["gcp_service_account"]), scopes=scopes)
-    return gspread.authorize(creds)
-
-
-def get_worksheet():
-    client = get_gsheet_client()
-    return client.open(SPREADSHEET_NAME).sheet1
+    sh = gspread.authorize(creds).open(SPREADSHEET_NAME)
+    try:
+        return sh.worksheet(LOG_TAB)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=LOG_TAB, rows=2000, cols=len(LOG_COLS))
+        ws.update([LOG_COLS])
+        return ws
 
 
 def load_log():
     try:
-        ws = get_worksheet()
-        records = ws.get_all_records()
-        if not records:
-            return pd.DataFrame(columns=LOG_COLUMNS)
-        df = pd.DataFrame(records)
-        for col in LOG_COLUMNS:
-            if col not in df.columns:
-                df[col] = None
-        df["entry_date"] = pd.to_datetime(df["entry_date"], errors="coerce")
-        df["exit_date"] = pd.to_datetime(df["exit_date"], errors="coerce")
-        return df[LOG_COLUMNS]
+        if TEST_LOG:
+            df = pd.read_csv(TEST_LOG, dtype=str) if os.path.exists(TEST_LOG) else pd.DataFrame(columns=LOG_COLS)
+        else:
+            recs = _worksheet().get_all_records()
+            df = pd.DataFrame(recs) if recs else pd.DataFrame(columns=LOG_COLS)
+        return _clean_log(df), None
     except Exception as e:
-        st.warning(f"Google Sheet log could not be read ({e}) — starting with an empty log for this view.")
-        return pd.DataFrame(columns=LOG_COLUMNS)
+        return pd.DataFrame(columns=LOG_COLS), f"The trade log could not be read ({e})."
 
 
 def save_log(df):
     try:
-        ws = get_worksheet()
-        out = df.copy()
-        out["entry_date"] = pd.to_datetime(out["entry_date"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
-        out["exit_date"] = pd.to_datetime(out["exit_date"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
-        out = out[LOG_COLUMNS].fillna("")
+        out = _clean_log(df.copy())
+        if TEST_LOG:
+            out.to_csv(TEST_LOG, index=False)
+            return None
+        rows = [[(x.item() if hasattr(x, "item") else x) for x in r] for r in out.values.tolist()]
+        ws = _worksheet()
         ws.clear()
-        ws.update([LOG_COLUMNS] + out.values.tolist())
+        ws.update([LOG_COLS] + rows)
+        return None
     except Exception as e:
-        st.error(f"Could not save to Google Sheet: {e}")
+        return f"The trade log could not be saved ({e})."
 
 
-def check_exit_1990(symbol, entry_price, stop_loss, entry_date):
-    df = fetch_ohlc(symbol)
-    if df is None:
-        return None
-    df_after = df[df.index.date > pd.Timestamp(entry_date).date()]  # never same-day exit
-    if df_after.empty:
-        return None
-    close, rsi2, sma5 = df["Close"], compute_rsi(df["Close"]), df["Close"].rolling(5).mean()
-    for date in df_after.index:
-        c = close.loc[date]
-        if c <= stop_loss:
-            return date, stop_loss, "SL hit"
-        if rsi2.loc[date] > 70:
-            return date, c, "RSI2>70"
-        if c > sma5.loc[date]:
-            return date, c, "Close>5SMA"
-    return None
+# ------------------------------------------------------------------ frozen-rule position tracking
+def _num(x, default=np.nan):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
 
 
-def check_exit_bollinger(symbol, entry_price, stop_loss, entry_date):
-    df = fetch_ohlc(symbol)
-    if df is None:
-        return None
-    df_after = df[df.index.date > pd.Timestamp(entry_date).date()]
-    if df_after.empty:
-        return None
-    close, mid = df["Close"], df["Close"].rolling(BB_WINDOW).mean()
-    for date in df_after.index:
-        c = close.loc[date]
-        if c <= stop_loss:
-            return date, stop_loss, "SL hit"
-        if c > mid.loc[date]:
-            return date, c, "Close>Mid-band"
-    return None
+def update_positions(log, D, L):
+    """Replays every non-closed row from its signal date with the frozen exit rules (raw rupee prices)."""
+    A, cal = D["A"], D["cal"]
+    jmap = {t: i for i, t in enumerate(D["tickers"])}
+    with np.errstate(all="ignore"):
+        rf = A["rawC"] / A["C"]
+    rows, stopped_today = [], []
+    for r in log.to_dict("records"):
+        if r["status"] in ("CLOSED", "SKIPPED"):
+            rows.append(r)
+            continue
+        j = jmap.get(r["symbol"])
+        sdt = pd.Timestamp(r["signal_date"]) if r["signal_date"] else None
+        sd = cal.searchsorted(sdt) if sdt is not None else len(cal)
+        if j is None or sd >= len(cal) or cal[sd] != sdt:
+            r["status"] = r["status"] or "PENDING"
+            rows.append(r)
+            continue
+        stop, qty = _num(r["stop_loss"]), int(_num(r["qty"], 0))
+        r.update(entry_date="", entry_price="", exit_date="", exit_price="", exit_reason="", pnl_pct="", pnl_rs="")
+        if sd >= L:
+            r["status"] = "PENDING"
+            rows.append(r)
+            continue
+        ed = sd + 1
+        o_in = A["O"][ed, j] * rf[ed, j]
+        if not np.isfinite(o_in):
+            r.update(status="SKIPPED", exit_reason="no trading on entry day")
+            rows.append(r)
+            continue
+        if o_in <= stop:
+            r.update(status="SKIPPED", exit_reason="opened below stop-loss")
+            rows.append(r)
+            continue
+        r.update(status="OPEN", entry_date=cal[ed].strftime("%Y-%m-%d"), entry_price=round(o_in, 2))
+        why, exit_px, exit_di, reason = None, None, None, None
+        for di in range(ed, L + 1):
+            if not np.isfinite(A["C"][di, j]):
+                continue
+            o, lo = A["O"][di, j] * rf[di, j], A["L"][di, j] * rf[di, j]
+            if why:
+                exit_px, exit_di, reason = o, di, why
+                break
+            if lo <= stop:
+                gap = di > ed and o <= stop
+                exit_px, exit_di, reason = (o if gap else stop), di, ("SL_gap" if gap else "SL")
+                break
+            if A["rsi"][di, j] > F.RSI_EXIT:
+                why = "RSI2>70"
+            elif A["C"][di, j] > A["sma5"][di, j]:
+                why = "Close>SMA5"
+            elif di - ed + 1 >= F.MAX_HOLD:
+                why = "MaxHold"
+        if exit_px is not None:
+            gross = qty * (exit_px - o_in)
+            net = gross - F.SIDE_COST * qty * (o_in + exit_px) - F.DP
+            r.update(status="CLOSED", exit_date=cal[exit_di].strftime("%Y-%m-%d"), exit_price=round(exit_px, 2),
+                     exit_reason=reason, pnl_pct=round(100 * (exit_px / o_in - 1), 2), pnl_rs=round(net, 0))
+            if exit_di == L and reason.startswith("SL"):
+                stopped_today.append(r)
+        else:
+            last = A["C"][L, j] * rf[L, j]
+            r.update(status="EXIT_PENDING" if why else "OPEN", exit_reason=why or "",
+                     pnl_pct=round(100 * (last / o_in - 1), 2),
+                     pnl_rs=round(qty * (last - o_in), 0))
+        rows.append(r)
+    return pd.DataFrame(rows, columns=LOG_COLS), stopped_today
 
 
-def update_open_trades(log_df):
-    for idx, row in log_df[log_df["status"] == "OPEN"].iterrows():
-        checker = check_exit_1990 if str(row["strategy"]).startswith("1990") else check_exit_bollinger
-        result = checker(row["symbol"], row["entry_price"], row["stop_loss"], row["entry_date"])
-        if result:
-            exit_date, exit_price, reason = result
-            pnl_pct = round((exit_price - row["entry_price"]) / row["entry_price"] * 100, 2)
-            log_df.loc[idx, ["status", "exit_date", "exit_price", "exit_reason", "pnl_pct", "win"]] = \
-                ["CLOSED", exit_date, round(exit_price, 2), reason, pnl_pct, pnl_pct > 0]
-    return log_df
+def pick_orders(log, D, L):
+    """Frozen priority: sector rank, then lowest RSI(2); 6 slots of Rs 25,000."""
+    A = D["A"]
+    held = log[log["status"].isin(["OPEN", "EXIT_PENDING", "PENDING"])]
+    held_syms = set(held["symbol"])
+    free = max(0, F.MAX_SLOTS - len(held))
+    cands = [int(j) for j in np.flatnonzero(D["frozen"][L]) if D["tickers"][j] not in held_syms]
+    cands.sort(key=lambda j: (D["rank"][L, D["sec_idx"][j]], A["rsi"][L, j]))
+    buys, skipped = [], []
+    for j in cands:
+        raw = A["rawC"][L, j]
+        item = dict(symbol=D["tickers"][j], sector=D["sectors"][D["sec_idx"][j]],
+                    rank=int(D["rank"][L, D["sec_idx"][j]]), rsi=float(A["rsi"][L, j]), close=float(raw))
+        qty = int(F.SLOT // raw)
+        if qty < 1:
+            skipped.append(dict(item, why="share price above ₹25,000"))
+            continue
+        if len(buys) >= free:
+            skipped.append(dict(item, why="no free slot"))
+            continue
+        stop = float(D["stop"][L, j] * raw / A["C"][L, j])
+        buys.append(dict(item, qty=qty, stop=round(stop, 2), value=qty * raw))
+    return buys, skipped, free
 
 
-def append_new_entries(log_df, entries_df, today):
-    open_symbols = set(log_df[log_df["status"] == "OPEN"]["symbol"])
-    new_rows = []
-    for _, e in entries_df.iterrows():
-        if e["symbol"] in open_symbols:
-            continue  # already holding this one — same discipline as trade_tracker.py
-        new_rows.append({
-            "symbol": e["symbol"], "sector": e["sector"], "regime": e["regime"], "strategy": e["strategy"],
-            "entry_date": today, "entry_price": e["entry"], "stop_loss": e["stop_loss"], "status": "OPEN",
-            "exit_date": None, "exit_price": None, "exit_reason": None, "pnl_pct": None, "win": None,
-        })
-    if new_rows:
-        log_df = pd.concat([log_df, pd.DataFrame(new_rows)], ignore_index=True)
-    return log_df
+# ------------------------------------------------------------------ scan
+def regime_name(adx, slope):
+    if not np.isfinite(adx) or not np.isfinite(slope):
+        return "No data"
+    if adx > F.ADX_STRONG and slope > 0:
+        return "Strong uptrend"
+    if adx > F.ADX_STRONG and slope < 0:
+        return "Strong downtrend"
+    if adx < 20:
+        return "Sideways"
+    return "Transitional"
 
 
-def run_full_scan():
-    universe = load_universe()
-    bollinger_ok = load_bollinger_list()
-    sector_stocks = universe.groupby("industry")["yfinance_symbol"].apply(list).to_dict()
+def run_scan():
+    now = now_ist()
+    today = now.date()
+    in_session = is_trading_day(today) and MARKET_OPEN <= now.time() < SCAN_AFTER
+    after_close = is_trading_day(today) and now.time() >= SCAN_AFTER
+    cur = load_universe()
+    log, log_err = load_log()
+    extra = [s for s in log.loc[log["status"].isin(["OPEN", "EXIT_PENDING", "PENDING"]), "symbol"]
+             if s and s not in set(cur["yfinance_symbol"])]
+    tickers = tuple(["^NSEI"] + list(cur["yfinance_symbol"]) + sorted(set(extra)))
+    end = today + dt.timedelta(days=1)
+    start = end - pd.DateOffset(years=HISTORY_YEARS)
+    w = load_prices(tickers, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
+                    "after" if now.time() >= SCAN_AFTER else "before")
+    if not after_close:
+        w = w[w["Date"] < pd.Timestamp(today)]          # never use an unfinished day
+    if "^NSEI" not in set(w["Ticker"]):
+        return dict(error="Nifty 50 prices could not be downloaded, so the market filter is treated as "
+                          "RISK-OFF. Try the scan again in a few minutes.")
+    D = F.build(w, cur, str(w["Date"].min().date()))
+    cal = D["cal"]
+    L = len(cal) - 1
+    as_of = cal[L].date()
+    mode = "orders"
+    if in_session:
+        mode = "market_hours"
+    elif after_close and as_of < today:
+        mode = "stale"
 
-    progress = st.progress(0, text="Layer 1: checking Nifty50...")
-    risk_on, nifty_close, nifty_ema = layer1_market_filter()
+    if mode == "orders":   # tonight's picks are rebuilt from scratch, so a second run changes nothing
+        log = log[~((log["status"] == "PENDING") & (log["signal_date"] == as_of.strftime("%Y-%m-%d")))]
+    log, stopped_today = update_positions(log, D, L)
+    buys, skipped = [], []
+    free = max(0, F.MAX_SLOTS - int(log["status"].isin(["OPEN", "EXIT_PENDING", "PENDING"]).sum()))
+    if mode == "orders":
+        buys, skipped, free = pick_orders(log, D, L)
+        new = pd.DataFrame([dict(symbol=b["symbol"], sector=b["sector"], signal_date=as_of.strftime("%Y-%m-%d"),
+                                 qty=b["qty"], stop_loss=b["stop"], status="PENDING") for b in buys],
+                           columns=LOG_COLS)
+        log = _clean_log(pd.concat([log, new], ignore_index=True)) if len(new) else log
+    save_err = save_log(log)
 
-    progress.progress(10, text="Layer 2: ranking sectors by relative strength...")
-    scores = []
-    sectors_list = list(sector_stocks.items())
-    for i, (sector, symbols) in enumerate(sectors_list):
-        syms = symbols[:MAX_STOCKS_PER_SECTOR]
-        sector_df, used = build_sector_index(syms)
-        if sector_df is not None and len(sector_df) > RS_LOOKBACK_DAYS + 5:
-            ret = (sector_df["Close"].iloc[-1] / sector_df["Close"].iloc[-RS_LOOKBACK_DAYS] - 1) * 100
-            scores.append({"sector": sector, "return_pct": round(ret, 2), "df": sector_df})
-        progress.progress(10 + int(50 * (i + 1) / len(sectors_list)),
-                           text=f"Layer 2: scanning sector {i+1}/{len(sectors_list)}...")
-
-    scores.sort(key=lambda x: x["return_pct"], reverse=True)
-    top_sector_names = {s["sector"] for s in scores[:TOP_N_SECTORS]}
-
-    progress.progress(65, text="Layer 3: detecting regime for every sector...")
-    regime_rows = []
-    for s in scores:
-        df = s["df"].copy()
-        df["EMA200"] = df["Close"].ewm(span=EMA_TREND_WINDOW, adjust=False).mean()
-        df["ADX14"] = compute_adx(df)
-        df["EMA_SLOPE"] = df["EMA200"] - df["EMA200"].shift(10)
-        latest = df.iloc[-1]
-        regime = classify_regime(latest["ADX14"], latest["EMA_SLOPE"])
-        s["regime"] = regime
-        s["adx"] = round(latest["ADX14"], 2)
-        s["slope"] = round(latest["EMA_SLOPE"], 3)
-        regime_rows.append({"sector": s["sector"], "relative_strength_%": s["return_pct"],
-                             "adx14": s["adx"], "ema_slope": s["slope"], "regime": regime,
-                             "in_top3": s["sector"] in top_sector_names})
-
-    # FIX (validated via combined_system_backtest.py historical replay): a sector strong
-    # enough to rank in the daily Top-3 almost never coincides with being Sideways/Choppy
-    # at the same time — gating Bollinger by Top-3 too starved it to just 8 trades in 3
-    # years. 1990 keeps the Top-3 gate (it measurably improved with it, 0.70%->1.01%/trade).
-    # Bollinger now scans EVERY Sideways/Choppy sector, Top-3 or not.
-    progress.progress(75, text="Layer 4: scanning for entries...")
-    entries = []
-    for s in scores:
-        sector, regime = s["sector"], s["regime"]
-        if regime == "Strong Uptrend" and sector in top_sector_names:
-            for sym in sector_stocks[sector]:
-                hit = scan_uptrend_stock(sym)
-                if hit:
-                    entries.append({"symbol": sym, "sector": sector, "regime": regime,
-                                     "strategy": "1990 (RSI2+200EMA)", "entry": hit[0], "stop_loss": hit[1]})
-        elif regime == "Sideways/Choppy" and ENABLE_BOLLINGER:
-            for sym in [st_sym for st_sym in sector_stocks[sector] if st_sym in bollinger_ok]:
-                hit = scan_sideways_stock(sym)
-                if hit:
-                    entries.append({"symbol": sym, "sector": sector, "regime": regime,
-                                     "strategy": "Bollinger mean-reversion", "entry": hit[0], "stop_loss": hit[1]})
-
-    progress.progress(100, text="Done!")
-    progress.empty()
-
-    return {
-        "risk_on": risk_on, "nifty_close": nifty_close, "nifty_ema": nifty_ema,
-        "top_sector_names": sorted(top_sector_names),
-        "sector_ranking": pd.DataFrame([{"sector": s["sector"], "return_pct": s["return_pct"]} for s in scores]),
-        "regime_table": pd.DataFrame(regime_rows),
-        "entries": pd.DataFrame(entries),
-    }
+    n = D["nifty"]
+    ema = D["nifty_ema"]
+    sec_rows = []
+    for si, s in enumerate(D["sectors"]):
+        rk = int(D["rank"][L, si])
+        sec_rows.append(dict(Rank=rk if rk < 99 else None, Sector=s,
+                             **{"21-day move %": round(100 * D["rs"][L, si], 2) if np.isfinite(D["rs"][L, si]) else None},
+                             ADX=round(float(D["adx"][L, si]), 1) if np.isfinite(D["adx"][L, si]) else None,
+                             Trend=regime_name(D["adx"][L, si], D["slope"][L, si]),
+                             Eligible="Yes" if (rk <= F.TOP_N and D["up"][L, si]) else ""))
+    sectors = pd.DataFrame(sec_rows).sort_values("Rank", na_position="last").reset_index(drop=True)
+    A = D["A"]
+    with np.errstate(invalid="ignore"):
+        ok = np.isfinite(A["C"][L]) & (A["bars"][L] >= F.MIN_BARS)
+        above = ok & (A["C"][L] > A["ema"][L])
+    order = np.argsort(D["sec_idx"], kind="stable")
+    dots = [(bool(above[j]) if ok[j] else None) for j in order]
+    sells = log[log["status"] == "EXIT_PENDING"].to_dict("records")
+    return dict(
+        error=None, mode=mode, as_of=as_of, next_session=next_trading_day(as_of),
+        nifty=dict(close=float(n.iloc[-1]), prev=float(n.iloc[-2]), ema=float(ema.iloc[-1]),
+                   risk_on=bool(D["risk_on"][L]), ret=float(D["nifty_ret1"][L]),
+                   dates=[d.strftime("%d %b") for d in n.index[-120:]],
+                   series=n.iloc[-120:].round(2).tolist(), ema_series=ema.iloc[-120:].round(2).tolist()),
+        sectors=sectors, dots=dots, breadth=(int(above.sum()), int(ok.sum())),
+        buys=buys, skipped=skipped, free=free, sells=sells, stopped_today=stopped_today,
+        log=log, log_err=log_err, save_err=save_err,
+        n_signals=int(D["frozen"][L].sum()), n_stocks=int(np.isfinite(A["C"][L]).sum()), n_total=len(D["tickers"]),
+    )
 
 
-# ================================== PAGE LAYOUT ==================================
-# NSE equity-segment trading holidays — source: official NSE 2026 holiday circular.
-# NOTE: this list is only for 2026 — update it each year (NSE publishes the next
-# year's list around December) or "next holiday" will stop finding anything past
-# Dec 25, 2026.
-NSE_HOLIDAYS_2026 = [
-    (datetime.date(2026, 1, 15), "Maharashtra Municipal Corp. Election"),
-    (datetime.date(2026, 1, 26), "Republic Day"),
-    (datetime.date(2026, 3, 3), "Holi"),
-    (datetime.date(2026, 3, 26), "Shri Ram Navami"),
-    (datetime.date(2026, 3, 31), "Shri Mahavir Jayanti"),
-    (datetime.date(2026, 4, 3), "Good Friday"),
-    (datetime.date(2026, 4, 14), "Dr. Baba Saheb Ambedkar Jayanti"),
-    (datetime.date(2026, 5, 1), "Maharashtra Day"),
-    (datetime.date(2026, 5, 28), "Bakri Id"),
-    (datetime.date(2026, 6, 26), "Muharram"),
-    (datetime.date(2026, 9, 14), "Ganesh Chaturthi"),
-    (datetime.date(2026, 10, 2), "Mahatma Gandhi Jayanti"),
-    (datetime.date(2026, 10, 20), "Dussehra"),
-    (datetime.date(2026, 11, 10), "Diwali-Balipratipada"),
-    (datetime.date(2026, 11, 24), "Prakash Gurpurb Sri Guru Nanak Dev"),
-    (datetime.date(2026, 12, 25), "Christmas"),
-]
+# ------------------------------------------------------------------ pieces of UI
+def svg_nifty(series, ema_series, dates):
+    w, h, pad = 620, 190, 6
+    vals = [v for v in series + ema_series if v == v]
+    lo, hi = min(vals), max(vals)
+    rng = (hi - lo) or 1
 
-def get_next_nse_holiday(today):
-    upcoming = [(d, name) for d, name in NSE_HOLIDAYS_2026 if d >= today]
-    return upcoming[0] if upcoming else (None, None)
+    def pts(arr):
+        n = len(arr)
+        return [(pad + i * (w - 2 * pad) / max(n - 1, 1), pad + (hi - v) * (h - 2 * pad) / rng) for i, v in enumerate(arr)]
 
-ist_now = datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
-next_holiday_date, next_holiday_name = get_next_nse_holiday(ist_now.date())
-if next_holiday_date:
-    days_away = (next_holiday_date - ist_now.date()).days
-    holiday_line = (f"📅 Next NSE holiday: {next_holiday_date.strftime('%d %b %Y')} "
-                     f"({next_holiday_name}) — in {days_away} day{'s' if days_away != 1 else ''}")
-else:
-    holiday_line = "📅 Next NSE holiday: update the 2026 list to add next year's dates"
+    p1, p2 = pts(series), pts(ema_series)
+    line = lambda p: "M" + " L".join(f"{x:.1f},{y:.1f}" for x, y in p)
+    area = line(p1) + f" L{p1[-1][0]:.1f},{h} L{p1[0][0]:.1f},{h} Z"
+    lx, ly = p1[-1]
+    ticks = "".join(f'<text x="{pad + i * (w - 2 * pad) / 4:.0f}" y="{h + 16}" fill="#8E8C9B" font-size="11" '
+                    f'text-anchor="middle">{esc(dates[min(len(dates) - 1, round(i * (len(dates) - 1) / 4))])}</text>'
+                    for i in range(5))
+    return f"""<svg viewBox="0 0 {w} {h + 22}" width="100%" role="img" aria-label="Nifty 50 and its 200-day average">
+<defs><pattern id="hatch" width="4" height="4" patternUnits="userSpaceOnUse"><rect width="1.3" height="4" fill="#C9B8FF" opacity=".28"/></pattern></defs>
+<path d="{area}" fill="url(#hatch)"/><path d="{line(p2)}" fill="none" stroke="#F3E28C" stroke-width="2"/>
+<path d="{line(p1)}" fill="none" stroke="#C9B8FF" stroke-width="2.4"/>
+<line x1="{lx:.1f}" y1="0" x2="{lx:.1f}" y2="{h}" stroke="#8E8C9B" stroke-dasharray="3 4"/>
+<circle cx="{lx:.1f}" cy="{ly:.1f}" r="6" fill="#F5F4F8" stroke="#C9B8FF" stroke-width="3"/>{ticks}</svg>"""
 
-st.markdown(f"""
-<div class="mm-header">
-    <span class="mm-clock">🕐 {ist_now.strftime('%A, %d %b %Y')}<br>{ist_now.strftime('%I:%M %p')} IST</span>
-    <h1>📊 Market Mood Dashboard</h1>
-    <p class="mm-welcome">Welcome, કૌશિક 👋</p>
-    <p>Regime-adaptive scanner — Layer 1 (market filter) → Layer 2 (sector rank) →
-    Layer 3 (regime) → Layer 4 (1990{' + Bollinger' if ENABLE_BOLLINGER else ''} entries).
-    Runs in PARALLEL with 1990's own live scanner — paper-track before real money.</p>
-    <p style="margin-top:8px;">{holiday_line}</p>
-</div>
-""", unsafe_allow_html=True)
-if not ENABLE_BOLLINGER:
-    st.info("ℹ️ Bollinger leg is currently OFF (out-of-sample results not trusted yet) — "
-            "only 1990 entries will show below.")
 
-if st.button("🔍 Run Today's Scan", type="primary"):
-    log_df = load_log()
-    log_df = update_open_trades(log_df)          # check existing OPEN positions for exits first
-    result = run_full_scan()
-    today = pd.Timestamp.today().normalize()
-    log_df = append_new_entries(log_df, result["entries"], today)   # log today's fresh entries
-    save_log(log_df)
-    st.session_state["result"] = result
-    st.session_state["log"] = log_df
-
-if "result" in st.session_state:
-    r = st.session_state["result"]
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        status = "🟢 RISK-ON" if r["risk_on"] else "🔴 RISK-OFF"
-        st.metric("Layer 1: Nifty50 vs 200EMA", status)
-        if r["nifty_close"]:
-            st.caption(f"Close: {r['nifty_close']} | 200EMA: {r['nifty_ema']}")
-    with col2:
-        st.metric("Layer 2: Top Sectors Today", ", ".join(r["top_sector_names"]) if r["top_sector_names"] else "—")
-    with col3:
-        st.metric("Layer 4: Entries Found", len(r["entries"]))
-
-    if not r["risk_on"]:
-        st.warning("Nifty50 is below its 200EMA — Master Plan says lean toward cash / reduce size today.")
-
-    st.subheader("🏆 Top 3 Sectors Today")
-    st.caption("1990 fires in these if Strong Uptrend. Bollinger also fires in ANY other "
-               "Sideways/Choppy sector below, Top-3 or not.")
-    top3_table = r["regime_table"][r["regime_table"]["in_top3"] == True] \
-        .sort_values("relative_strength_%", ascending=False) \
-        .drop(columns=["in_top3"])
-    st.dataframe(top3_table, use_container_width=True, hide_index=True)
-
-    with st.expander("બધા 18 sectors જોવા (વિગતવાર)"):
-        st.dataframe(r["regime_table"].sort_values("relative_strength_%", ascending=False),
-                     use_container_width=True, hide_index=True)
-
-    st.subheader("✅ TRADEABLE TODAY")
-    if r["entries"].empty:
-        st.info("No entries today across the top sectors.")
+def card_nifty(res):
+    if not res:
+        return ('<div class="mm-card tall"><div class="mm-h"><span class="mm-t">Nifty 50</span></div>'
+                '<div class="mm-empty">Run today\'s scan to load the market. After 4:00 pm IST it also '
+                'prepares tomorrow\'s orders.</div></div>')
+    nf = res["nifty"]
+    badge = "b-up" if nf["ret"] >= 0 else "b-dn"
+    arrow = "↗" if nf["ret"] >= 0 else "↘"
+    risk = '<span class="b-up">Risk-on</span>' if nf["risk_on"] else '<span class="b-dn">Risk-off</span>'
+    dip = nf["ret"] <= F.NIFTY_DIP
+    if not nf["risk_on"]:
+        verdict = "<b>No buys.</b> Nifty is below its 200-day average (risk-off)."
+    elif not dip:
+        verdict = f"<b>No new buys.</b> Nifty moved {nf['ret'] * 100:+.2f}%; buys need a fall of 0.5% or more."
     else:
-        st.dataframe(r["entries"], use_container_width=True, hide_index=True)
-        st.download_button("Download as CSV", r["entries"].to_csv(index=False), "market_mood_today.csv")
+        k = res["n_signals"]
+        verdict = (f"<b>Buy day.</b> Nifty fell {abs(nf['ret']) * 100:.2f}% in a risk-on market; "
+                   f"{k} {'stock' if k == 1 else 'stocks'} qualified.")
+    return f"""<div class="mm-card tall">
+<div class="mm-h"><span class="mm-t">Nifty 50</span><span class="mm-chip">Close {res['as_of'].strftime('%d %b %Y')}</span></div>
+<div style="display:flex;gap:26px;align-items:flex-end;flex-wrap:wrap">
+ <div><div class="mm-big">{indian(nf['close'], 2)}</div>
+  <div class="mm-sub"><span class="{badge}">{arrow} {nf['ret'] * 100:+.2f}%</span>&nbsp; today</div></div>
+ <div><div class="mm-big" style="font-size:30px">{indian(nf['ema'], 0)}</div>
+  <div class="mm-sub">200-day average &nbsp;{risk}</div></div>
+</div>
+<div style="margin-top:10px">{svg_nifty(nf['series'], nf['ema_series'], nf['dates'])}</div>
+<div class="mm-verdict">{verdict}</div></div>"""
 
-    st.divider()
-    st.subheader("📒 Paper Trade Log (all-time, this is how we judge performance)")
-    st.caption("✅ This log now lives in Google Sheets (\"market-mood-bot\"), not on Streamlit's "
-               "server — it survives redeploys and app restarts. The download button below is "
-               "just an optional extra copy, not required for safety anymore.")
-    log_df = st.session_state.get("log", load_log())
-    if not log_df.empty:
-        st.download_button("⬇️ Download full log (optional copy)", log_df.to_csv(index=False),
-                            f"market_mood_log_backup_{ist_now.strftime('%Y%m%d')}.csv")
-    closed = log_df[log_df["status"] == "CLOSED"]
-    open_pos = log_df[log_df["status"] == "OPEN"]
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total logged", len(log_df))
-    c2.metric("Closed trades", len(closed))
-    c3.metric("Overall win rate", f"{closed['win'].mean()*100:.1f}%" if len(closed) else "—")
+def calendar_html(now):
+    today = now.date()
+    first = today.replace(day=1)
+    nxt = (first + dt.timedelta(days=32)).replace(day=1)
+    days = (nxt - first).days
+    cells = ['<div class="wd">' + d + "</div>" for d in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]]
+    cells += ['<div class="d blank"></div>'] * first.weekday()
+    for k in range(days):
+        d = first + dt.timedelta(days=k)
+        cls = ["d"]
+        tip = ""
+        if d.weekday() >= 5:
+            cls.append("we")
+        if d in NSE_HOLIDAYS:
+            cls.append("hol")
+            tip = f' title="{esc(NSE_HOLIDAYS[d])}"'
+        if d == today:
+            cls.append("today")
+        dot = '<i></i>' if d in NSE_HOLIDAYS else ""
+        cells.append(f'<div class="{" ".join(cls)}"{tip}>{d.day}{dot}</div>')
+    upcoming = sorted(d for d in NSE_HOLIDAYS if d >= today)
+    if upcoming:
+        h = upcoming[0]
+        n_days = (h - today).days
+        when = "today" if n_days == 0 else ("tomorrow" if n_days == 1 else f"in {n_days} days")
+        nxt_html = f'<div class="big">{h.strftime("%d %b")}</div><div class="sub">{esc(NSE_HOLIDAYS[h])}, {when}</div>'
+    else:
+        nxt_html = '<div class="big">—</div><div class="sub">Add the 2027 NSE holiday list</div>'
+    hol_js = ",".join(f'"{d.isoformat()}"' for d in NSE_HOLIDAYS)
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;600;700&display=swap" rel="stylesheet">
+<style>
+body{{margin:0;background:transparent;font-family:'Manrope',sans-serif;color:#F5F4F8;}}
+.card{{background:#18181E;border:1px solid #26262F;border-radius:24px;padding:18px 18px 16px 18px;height:372px;box-sizing:border-box;}}
+.top{{display:flex;justify-content:space-between;align-items:center;}}
+.month{{border:1px solid #26262F;border-radius:999px;padding:6px 14px;font-size:13px;}}
+.clock{{font-size:22px;font-weight:300;letter-spacing:-.02em;}}
+.clock small{{font-size:11px;color:#8E8C9B;margin-left:4px;}}
+.state{{font-size:12px;margin:10px 0 8px 2px;color:#8E8C9B;}}
+.state b{{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:#8E8C9B;}}
+.state.open b{{background:#8BE3B4;}}
+.grid{{display:grid;grid-template-columns:repeat(7,1fr);gap:5px;}}
+.wd{{font-size:10px;color:#8E8C9B;text-align:center;padding-bottom:2px;}}
+.d{{position:relative;background:#222229;border-radius:10px;height:27px;display:flex;align-items:center;
+   justify-content:center;font-size:12px;color:#C9C7D3;}}
+.d.blank{{background:transparent;}} .d.we{{color:#5E5C6A;background:#1C1C22;}}
+.d.hol{{background:#C9B8FF;color:#0E0E12;font-weight:700;}}
+.d i{{position:absolute;bottom:3px;width:4px;height:4px;border-radius:50%;background:#0E0E12;}}
+.d.today{{outline:2px solid #F5F4F8;outline-offset:-2px;font-weight:700;}}
+.next{{margin-top:12px;background:#222229;border-radius:16px;padding:10px 14px;display:flex;align-items:baseline;gap:12px;}}
+.next .big{{font-size:28px;font-weight:300;letter-spacing:-.03em;}}
+.next .sub{{font-size:12px;color:#8E8C9B;}}
+.next .lab{{font-size:11px;color:#8E8C9B;}}
+</style></head><body><div class="card">
+<div class="top"><span class="month">{now.strftime('%B %Y')}</span><span class="clock" id="clk">--:--<small>IST</small></span></div>
+<div class="state" id="st"><b></b>…</div>
+<div class="grid">{''.join(cells)}</div>
+<div class="next"><div><div class="lab">Next NSE holiday</div>{nxt_html}</div></div>
+</div>
+<script>
+const HOL=[{hol_js}];
+function tick(){{
+ const now=new Date();
+ const f=new Intl.DateTimeFormat('en-GB',{{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false,weekday:'short',year:'numeric',month:'2-digit',day:'2-digit'}});
+ const p={{}}; f.formatToParts(now).forEach(x=>p[x.type]=x.value);
+ const hh=+p.hour, mm=+p.minute, iso=p.year+'-'+p.month+'-'+p.day;
+ const h12=((hh%12)||12), ap=hh<12?'AM':'PM';
+ document.getElementById('clk').innerHTML=h12+':'+p.minute+':'+p.second+' '+ap+'<small>IST</small>';
+ const wk=!['Sat','Sun'].includes(p.weekday), hol=HOL.includes(iso), t=hh*60+mm;
+ const open=wk&&!hol&&t>=555&&t<930;
+ const el=document.getElementById('st');
+ el.className='state'+(open?' open':'');
+ el.innerHTML='<b></b>'+(open?'Market open, closes 3:30 pm':(hol?'Market holiday today':(wk&&t<555?'Market opens 9:15 am':'Market closed')));
+}}
+tick(); setInterval(tick,1000);
+</script></body></html>"""
 
-    if not closed.empty:
-        st.write("**By strategy (this is the number that decides Step 5 — compare to 1990's own results):**")
-        summary = closed.groupby("strategy").agg(
-            trades=("win", "count"), win_rate=("win", "mean"), avg_pnl_pct=("pnl_pct", "mean")
-        ).round(3)
-        st.dataframe(summary, use_container_width=True)
 
-    st.write(f"**Open positions ({len(open_pos)}):**")
-    st.dataframe(open_pos.drop(columns=["exit_date", "exit_price", "exit_reason", "pnl_pct", "win"]),
-                 use_container_width=True, hide_index=True)
+def card_slots(res, log):
+    rows = log[log["status"].isin(["OPEN", "EXIT_PENDING", "PENDING"])].to_dict("records") if log is not None else []
+    bars = []
+    for r in rows[:F.MAX_SLOTS]:
+        st_ = r["status"]
+        held = 1
+        if st_ != "PENDING" and r.get("entry_date"):
+            held = max(1, np.busday_count(pd.Timestamp(r["entry_date"]).date(), (res["as_of"] if res else dt.date.today()) + dt.timedelta(days=1)))
+        hpct = 18 + 82 * min(held, F.MAX_HOLD) / F.MAX_HOLD if st_ != "PENDING" else 30
+        cls = {"OPEN": "open", "EXIT_PENDING": "sell", "PENDING": "buy"}[st_]
+        pnl = _num(r.get("pnl_pct"))
+        top = "buy" if st_ == "PENDING" else (f"{pnl:+.1f}%" if np.isfinite(pnl) else "—")
+        bars.append(f'<div class="mm-slot"><span class="top">{esc(top)}</span><div class="bar {cls}" style="height:{hpct:.0f}%"></div>'
+                    f'<span class="lab">{esc(short(r["symbol"]))[:10]}</span></div>')
+    for _ in range(F.MAX_SLOTS - len(bars)):
+        bars.append('<div class="mm-slot"><span class="top" style="background:transparent;color:#8E8C9B">free</span>'
+                    '<div class="bar free"></div><span class="lab">—</span></div>')
+    used = min(len(rows), F.MAX_SLOTS)
+    return f"""<div class="mm-card tall">
+<div class="mm-h"><span class="mm-t">Slots</span><span class="mm-chip">6 × ₹25,000</span></div>
+<div class="mm-big">{F.MAX_SLOTS - used}<span style="font-size:18px;color:#8E8C9B"> of 6 free</span></div>
+<div class="mm-slots">{''.join(bars)}</div>
+<div class="mm-legend"><span><i style="background:#C9B8FF"></i>holding (height = days held)</span>
+<span><i style="background:#F3E28C"></i>sell at next open</span><span><i style="background:repeating-linear-gradient(135deg,#F3E28C 0 3px,#3a3726 3px 6px)"></i>buy at next open</span></div>
+</div>"""
 
-    st.write(f"**Closed trades ({len(closed)}):**")
-    st.dataframe(closed, use_container_width=True, hide_index=True)
 
-    st.download_button("Download full log CSV", log_df.to_csv(index=False), "market_mood_log.csv")
-    st.caption("⚠️ Same caveat as trade_log.csv on the RSI2 dashboard: this file's persistence on "
-               "Streamlit Cloud's free tier isn't guaranteed across app restarts/redeploys. "
-               "Download this CSV as a backup every few days until Google Sheets logging is set up.")
+def card_orders(res):
+    if not res:
+        return ('<div class="mm-card mid"><div class="mm-h"><span class="mm-t">Next orders</span></div>'
+                '<div class="mm-empty">Orders appear here after the evening scan.</div></div>')
+    head = f'Orders for {res["next_session"].strftime("%a, %d %b")} at 9:15 am'
+    rows = []
+    for s in res["sells"]:
+        rows.append(f'<div class="mm-row"><span class="b-but">SELL</span><div class="grow"><div class="nm">{esc(short(s["symbol"]))}</div>'
+                    f'<div class="dt">{esc(REASON_TEXT.get(s["exit_reason"], s["exit_reason"]))}, {esc(s["qty"])} shares</div></div>'
+                    f'<div class="val">market order</div></div>')
+    for b in res["buys"]:
+        lim = b["stop"] * (1 - GTT_LIMIT_BELOW)
+        rows.append(f'<div class="mm-row"><span class="b-lav">BUY</span><div class="grow"><div class="nm">{esc(short(b["symbol"]))}</div>'
+                    f'<div class="dt">{esc(b["sector"])}, sector {b["rank"]}, RSI(2) {b["rsi"]:.1f}</div></div>'
+                    f'<div class="val">{b["qty"]} sh ≈ {inr(b["value"])}<br><span style="color:#8E8C9B;font-weight:500">'
+                    f'GTT {indian(b["stop"], 2)} / limit {indian(lim, 2)}</span></div></div>')
+    if res["mode"] == "market_hours":
+        body = '<div class="mm-empty">The market day is not finished. Tomorrow\'s orders appear after 4:00 pm IST.</div>'
+    elif res["mode"] == "stale":
+        body = '<div class="mm-empty">Today\'s closing prices are not available yet. Run the scan again in 15 minutes.</div>'
+    elif not rows:
+        body = '<div class="mm-empty">No orders. Nothing to buy or sell at the next open.</div>'
+    else:
+        body = "".join(rows)
+    extra = ""
+    if res["skipped"]:
+        names = ", ".join(f'{short(s["symbol"])} ({s["why"]})' for s in res["skipped"][:6])
+        extra = f'<div class="mm-note">Also qualified but not bought: {esc(names)}</div>'
+    if res["stopped_today"]:
+        names = ", ".join(short(s["symbol"]) for s in res["stopped_today"])
+        extra += f'<div class="mm-note">Stop-loss hit today: {esc(names)}. Check that the GTT order sold them.</div>'
+    return f'<div class="mm-card mid"><div class="mm-h"><span class="mm-t">{esc(head)}</span></div>{body}{extra}</div>'
+
+
+def card_sectors(res):
+    if not res:
+        return '<div class="mm-card mid"><div class="mm-h"><span class="mm-t">Strongest sectors</span></div><div class="mm-empty">Sector strength loads with the scan.</div></div>'
+    top = res["sectors"].dropna(subset=["Rank"]).head(3).to_dict("records")
+    spots = [(0, 16, 170, "#C9B8FF"), (150, 110, 130, "#F3E28C"), (160, 0, 104, "#9FD4FF")]
+    bub = []
+    for (x, y, size, col), s in zip(spots, top):
+        ok = "Top-2, uptrend" if s["Eligible"] else s["Trend"]
+        move = s["21-day move %"]
+        bub.append(f'<div class="mm-bub" style="left:{x}px;top:{y}px;width:{size}px;height:{size}px;background:{col}">'
+                   f'<b style="font-size:{22 if size > 120 else 17}px">{move:+.1f}%</b><span>{esc(s["Sector"])}</span>'
+                   f'<span style="opacity:.75">{esc(ok)}</span></div>')
+    return (f'<div class="mm-card mid"><div class="mm-h"><span class="mm-t">Strongest sectors</span>'
+            f'<span class="mm-chip">21-day move</span></div><div class="mm-bubbles">{"".join(bub)}</div></div>')
+
+
+def card_breadth(res):
+    if not res:
+        return '<div class="mm-card mid"><div class="mm-h"><span class="mm-t">Market breadth</span></div><div class="mm-empty">Breadth loads with the scan.</div></div>'
+    up, tot = res["breadth"]
+    cols, r, gap = 25, 4.2, 12.4
+    circles = []
+    for i, v in enumerate(res["dots"]):
+        cx, cy = 6 + (i % cols) * gap, 6 + (i // cols) * gap
+        fill = "#3A3A45" if v is None else ("#C9B8FF" if v else "#2A2A33")
+        circles.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r}" fill="{fill}"/>')
+    h = 12 + ((len(res["dots"]) - 1) // cols) * gap
+    pct = 100 * up / tot if tot else 0
+    return f"""<div class="mm-card mid"><div class="mm-h"><span class="mm-t">Market breadth</span><span class="mm-chip">above 200-day average</span></div>
+<div class="mm-big" style="font-size:38px">{pct:.0f}%<span style="font-size:15px;color:#8E8C9B"> &nbsp;{up} of {tot} stocks</span></div>
+<svg viewBox="0 0 {12 + (cols - 1) * gap:.0f} {h:.0f}" width="100%" style="margin-top:12px" role="img" aria-label="Nifty 500 breadth, grouped by sector">{''.join(circles)}</svg>
+<div class="mm-note">Each dot is one Nifty 500 stock, grouped by sector. Lavender: above its 200-day average.</div></div>"""
+
+
+def card_positions(res, log):
+    rows = log[log["status"].isin(["OPEN", "EXIT_PENDING"])].to_dict("records") if log is not None else []
+    items = []
+    for r in rows:
+        pnl = _num(r.get("pnl_pct"))
+        b = ("b-up" if pnl >= 0 else "b-dn") if np.isfinite(pnl) else "b-lav"
+        txt = f"{pnl:+.2f}%" if np.isfinite(pnl) else "—"
+        items.append(f'<div class="mm-row"><div class="grow"><div class="nm">{esc(short(r["symbol"]))}</div>'
+                     f'<div class="dt">Bought {esc(pretty_date(r.get("entry_date", "")))} at {indian(_num(r.get("entry_price"), 0), 2)}, '
+                     f'stop {indian(_num(r.get("stop_loss"), 0), 2)}</div></div>'
+                     f'<span class="{b}">{txt}</span></div>')
+    body = "".join(items) if items else '<div class="mm-empty">No open positions.</div>'
+    closed = log[log["status"] == "CLOSED"] if log is not None else pd.DataFrame()
+    total = pd.to_numeric(closed["pnl_rs"], errors="coerce").sum() if len(closed) else 0.0
+    tail = f'<div class="mm-note">Closed trades: {len(closed)}, net {inr(total)} after costs</div>' if len(closed) else ""
+    return f'<div class="mm-card mid"><div class="mm-h"><span class="mm-t">Open positions</span></div>{body}{tail}</div>'
+
+
+FOOTER = f"""<div class="mm-foot">
+<b>Disclaimer.</b> {OWNER} is not a SEBI-registered investment adviser or research analyst. This dashboard is a
+personal research tool that shows the output of a rule-based system. It is not investment advice and not a
+recommendation to buy or sell any security. Backtested or past results do not guarantee future returns.
+Investing in the stock market involves risk, including the loss of capital. Anyone who invests does so with
+their own money and at their own risk; {OWNER} accepts no responsibility for any profit or loss arising from
+the use of this information.<br><br>
+Any query? Please contact <a href="mailto:{EMAIL}">{EMAIL}</a>
+</div>"""
+
+
+# ------------------------------------------------------------------ page
+now = now_ist()
+c1, c2, c3 = st.columns([2.2, 1.05, 1.9], vertical_alignment="center")
+with c1:
+    st.markdown('<div class="mm-brand">Market Mood<small>Rule-based swing system for Nifty 500 stocks, frozen rules v1</small></div>',
+                unsafe_allow_html=True)
+with c2:
+    run = st.button("Run today's scan", type="primary", width="stretch")
+with c3:
+    st.markdown(f"""<div class="mm-profile"><div class="mm-avatar">KT</div><div>
+<div class="mm-pname">{OWNER}</div><div class="mm-pmail"><a href="mailto:{EMAIL}">{EMAIL}</a></div></div></div>""",
+                unsafe_allow_html=True)
+
+if run:
+    with st.spinner("Downloading 5 years of prices for 500 stocks and running the frozen rules (1–3 minutes)…"):
+        st.session_state["res"] = run_scan()
+
+res = st.session_state.get("res")
+if res and res.get("error"):
+    st.error(res["error"])
+    res = None
+if res:
+    log = res["log"]
+    if res["log_err"]:
+        st.warning(res["log_err"])
+    if res["save_err"]:
+        st.warning(res["save_err"])
+    if res["n_stocks"] < 0.9 * res["n_total"]:
+        st.warning(f"Only {res['n_stocks']} of {res['n_total']} stocks have prices for {res['as_of']:%d %b}. "
+                   "Yahoo may be slow; run the scan again later before placing orders.")
 else:
-    st.info("Click **Run Today's Scan** to check today's market mood.")
+    log, err = load_log()
+    if err:
+        st.warning(err)
+
+tab_over, tab_pos, tab_sec, tab_rules = st.tabs(["Overview", "Positions", "Sectors", "Rules"])
+
+with tab_over:
+    a, b, c = st.columns([1.55, 1.05, 1.15], gap="medium")
+    with a:
+        st.markdown(card_nifty(res), unsafe_allow_html=True)
+    with b:
+        if hasattr(st, "iframe"):
+            st.iframe(calendar_html(now), height=376)
+        else:
+            components.html(calendar_html(now), height=376)
+    with c:
+        st.markdown(card_slots(res, log), unsafe_allow_html=True)
+    st.write("")
+    d, e, f, g = st.columns([1.35, 0.95, 1.1, 1.0], gap="medium")
+    with d:
+        st.markdown(card_orders(res), unsafe_allow_html=True)
+    with e:
+        st.markdown(card_sectors(res), unsafe_allow_html=True)
+    with f:
+        st.markdown(card_breadth(res), unsafe_allow_html=True)
+    with g:
+        st.markdown(card_positions(res, log), unsafe_allow_html=True)
+
+with tab_pos:
+    view = (log.copy() if log is not None else pd.DataFrame(columns=LOG_COLS)).astype(str)
+    view["symbol"] = view["symbol"].map(short)
+    live = view[view["status"].isin(["PENDING", "OPEN", "EXIT_PENDING"])]
+    done = view[view["status"].isin(["CLOSED", "SKIPPED"])]
+    st.markdown("#### Current positions")
+    if len(live):
+        st.dataframe(live, hide_index=True, width="stretch")
+    else:
+        st.caption("No open or pending positions.")
+    st.markdown("#### Closed trades")
+    if len(done):
+        cl = done[done["status"] == "CLOSED"]
+        pnl = pd.to_numeric(cl["pnl_rs"], errors="coerce")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Closed trades", len(cl))
+        m2.metric("Winning trades", f"{100 * (pnl > 0).mean():.0f}%" if len(cl) else "—")
+        m3.metric("Net profit (after costs)", inr(pnl.sum()) if len(cl) else "—")
+        st.dataframe(done.iloc[::-1], hide_index=True, width="stretch")
+    else:
+        st.caption("No closed trades yet.")
+    st.caption("The log lives in the Google Sheet 'market-mood-bot', tab 'system_log_v1'. It follows the frozen "
+               "rules exactly; if you skip a trade in real life, delete its row there.")
+
+with tab_sec:
+    if res:
+        st.dataframe(res["sectors"], hide_index=True, width="stretch")
+        st.caption("Buys are allowed only in sectors ranked 1 or 2 that are also in a strong uptrend "
+                   "(ADX above 25 and a rising 200-day average).")
+    else:
+        st.caption("Run today's scan to see all sectors.")
+
+with tab_rules:
+    st.markdown("""
+#### Frozen rules v1 (26 Sep 2026)
+**When to buy** (checked after the close, bought at the next day's open):
+1. Nifty 50 closes above its 200-day average (risk-on).
+2. Nifty 50 closes 0.5% or more below the previous close (a market-wide dip).
+3. The stock's sector ranks 1 or 2 by 21-day strength and is in a strong uptrend.
+4. The stock closes above its 200-day average with RSI(2) below 10.
+
+**How much:** 6 slots of ₹25,000. Share count = ₹25,000 ÷ signal-day close. When more stocks qualify than
+free slots, the stronger sector goes first, then the lower RSI(2).
+
+**When to sell** (whichever comes first):
+1. Stop-loss = signal-day close − 2 × ATR(14), active from the day of purchase (GTT order).
+2. RSI(2) above 70, or a close above the 5-day average → sell at the next open.
+3. Still holding after 10 trading days → sell at the next open.
+
+**Test results before going live** (costs included): 2016–2023 locked test, never used to build the rules:
+493 trades, +0.77% per trade, 6.6% a year, largest fall 9.4% (Nifty's was 38.4%). All pass criteria met.
+Past and tested results do not guarantee future returns.
+""")
+
+st.markdown(FOOTER, unsafe_allow_html=True)
